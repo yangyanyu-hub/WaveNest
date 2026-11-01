@@ -75,11 +75,16 @@ public class DroneContextAdapter implements DroneContextPort {
         if (currentNestId == null || currentNestId.isBlank()) {
             currentNestId = drone.getHomeNestId();
         }
+        // 当前巢与原巢相同时不重复查同一行（评审 HIGH.9）
         NestEntity nest = nestMapper.selectById(currentNestId);
-        if (nest == null || nest.getLon() == null || nest.getLat() == null) {
-            currentNestId = drone.getHomeNestId();
-            nest = nestMapper.selectById(currentNestId);
+        if ((nest == null || nest.getLon() == null || nest.getLat() == null)
+                && !currentNestId.equals(drone.getHomeNestId())) {
+            nest = nestMapper.selectById(drone.getHomeNestId());
         }
+        // 机巢查不到或坐标缺失 ⇒ 返回 null（评审 HIGH.9）：
+        // 原实现在「当前巢缺坐标」时会静默回落到原巢再查一次，等于把求解起点
+        // 悄悄换成原巢——起点与执行机实际位置不符，会面点会算到错的地方。
+        // 宁可拒绝求解（端口契约允许 null），也不拿一个"看起来合理"的错起点继续算。
         if (nest == null || nest.getLon() == null || nest.getLat() == null) {
             return null;
         }

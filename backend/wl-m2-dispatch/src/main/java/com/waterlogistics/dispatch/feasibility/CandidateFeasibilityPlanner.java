@@ -63,6 +63,9 @@ public class CandidateFeasibilityPlanner {
     /** 机巢「可用」状态词（与 {@code CandidateSelector} 同口径）。 */
     private static final String NEST_AVAILABLE = "可用";
 
+    /** 无人机「健康」状态词（照 {@code 001_init.sql} 列注释「健康/告警」，与 CandidateSelector 同口径）。 */
+    private static final String STATUS_HEALTH_OK = "健康";
+
     // 以下两个能耗标定值在 sys_param 中无对应键，按纪律不臆造键名，
     // 沿用 FeasibilityJudge.Params.defaults() 的演示标定值（1.5 %/km、0.2 %/kg）。
     private static final double BATTERY_PER_KM_PERCENT = 1.5;
@@ -224,8 +227,9 @@ public class CandidateFeasibilityPlanner {
      * 两个对外方法只在此基础上各做各的收尾（抛异常 / 透出原因），判定口径完全一致。
      */
     private Evaluated evaluate(OrderTaskEntity order) {
+        CandidateInput input = buildInput(order);
         List<CandidateGenerator.CandidateCombo> combos = candidateService.generate(
-                buildInput(order), generatorParams());
+                input, generatorParams());
 
         long nowMs = System.currentTimeMillis();
         double fallbackWindMs = weatherSettings.warningWindMs();
@@ -239,8 +243,8 @@ public class CandidateFeasibilityPlanner {
         double payloadKg = order.getGoodsWeight() != null
                 ? order.getGoodsWeight().doubleValue() : 0.0;
 
-        FeasibleCandidatePicker.Selection selection =
-                FeasibleCandidatePicker.pick(combos, worstWindMs, payloadKg, judgeParams());
+        FeasibleCandidatePicker.Selection selection = FeasibleCandidatePicker.pick(
+                combos, worstWindMs, payloadKg, judgeParams(input));
         return new Evaluated(selection, combos, worstWindMs);
     }
 
@@ -257,18 +261,53 @@ public class CandidateFeasibilityPlanner {
      * 可行性判定参数：能对上的读 {@code sys_param}，对不上的用演示标定值。
      *
      * <ul>
-     *   <li>{@code maxWindMs}（机型抗风未登记时的回落上限）←
-     *       {@code weatherWindCriticalThreshold}（12.0）；</li>
+     *   <li>{@code maxWindMs}（机型抗风未登记时的回落上限）← <b>见 {@link #conservativeWindFallbackMs}</b>
+     *       （评审 MEDIUM.16：不再用 {@code criticalWindMs=12.0}，那是全部已登记机型里最宽松的一档）；</li>
      *   <li>{@code reserveBatteryPercent} ← {@code minBatteryPercent}（30）；</li>
      *   <li>两个能耗系数无登记键，见本类常量。</li>
      * </ul>
      */
-    private FeasibilityJudge.Params judgeParams() {
+    private FeasibilityJudge.Params judgeParams(CandidateInput input) {
         return new FeasibilityJudge.Params(
-                weatherSettings.criticalWindMs(),
+                conservativeWindFallbackMs(input),
                 sysParamLoader.getDouble("minBatteryPercent", 30.0),
                 BATTERY_PER_KM_PERCENT,
                 BATTERY_PER_KG_PERCENT);
+    }
+
+    /**
+     * 机型抗风<b>未登记</b>时的回落上限（m/s）——<b>取保守值，不再用 12.0</b>（评审 MEDIUM.16 · 硬判据 4）。
+     *
+     * <p><b>原缺陷</b>：回落值取 {@code criticalWindMs()}（12.0），那是「气象熔断」阈值，
+     * 也是全部已登记机型里抗风最高的一档。于是 <b>未登记抗风恰恰是最宽松的</b>——
+     * 台账漏填一行的机型反而比填了的更"能扛风"，等于用数据缺失换豁免。
+     *
+     * <p><b>新口径</b>：取两个已登记值的较小者——
+     * <ol>
+     *   <li><b>本次候选集里</b>已登记机型抗风上限的最小值（同一批任务里最弱的那架能扛多少）；</li>
+     *   <li>{@code weatherWindWarningThreshold}（8.0 m/s，{@link WeatherSettings#warningWindMs()}）——
+     *       本项目的"需要开始注意的风"。</li>
+     * </ol>
+     * 候选集里没有一个登记值时退回预警阈值。结果只会比原口径<b>更严或持平</b>，不可能更宽松。
+     *
+     * <p>取候选集而非全表：未登记的机器若混在一批都很强的机型里，不该因为表里别处有个弱机型
+     * 就被压到那个值；同批比较才是「同一风速下 A 淘汰、B 保留」的真实语境。
+     *
+     * <p>判定端在原因里会写明「按保守口径判」，现场能看出这是回落而非真值。
+     */
+    private double conservativeWindFallbackMs(CandidateInput input) {
+        double warning = weatherSettings.warningWindMs();
+        double registeredMin = Double.POSITIVE_INFINITY;
+        for (CandidateInput.DroneView drone : input.drones()) {
+            if (drone.hasWindLimit() && drone.windLimitMs() < registeredMin) {
+                registeredMin = drone.windLimitMs();
+            }
+        }
+        double fallback = Math.min(warning, registeredMin);
+        if (!Double.isFinite(fallback) || fallback <= 0) {
+            return warning;
+        }
+        return fallback;
     }
 
     /**
@@ -283,7 +322,10 @@ public class CandidateFeasibilityPlanner {
     private CandidateInput buildInput(OrderTaskEntity order) {
         List<DroneEntity> drones = droneMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<DroneEntity>()
-                        .eq(DroneEntity::getStatus, STATUS_IDLE));
+                        .eq(DroneEntity::getStatus, STATUS_IDLE)
+                        // 健康状态过滤（评审 HIGH.6）：与 CandidateSelector 同口径，
+                        // 只放行「健康」，NULL／「告警」一律不进候选
+                        .eq(DroneEntity::getHealthStatus, STATUS_HEALTH_OK));
         List<NestEntity> nests = nestMapper.selectList(
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<NestEntity>()
                         .eq(NestEntity::getStatus, NEST_AVAILABLE));
@@ -295,14 +337,11 @@ public class CandidateFeasibilityPlanner {
 
         List<CandidateInput.NestView> nestViews = new ArrayList<>();
         for (NestEntity nest : nests) {
-            List<String> allowed = nest.getSupportedModels() != null
-                    ? Arrays.asList(nest.getSupportedModels().split(","))
-                    : List.of();
             nestViews.add(new CandidateInput.NestView(
                     nest.getNestId(),
                     nest.getLon() != null ? nest.getLon().doubleValue() : 0.0,
                     nest.getLat() != null ? nest.getLat().doubleValue() : 0.0,
-                    allowed));
+                    splitModels(nest.getSupportedModels())));
         }
 
         List<CandidateInput.DroneView> droneViews = new ArrayList<>();
@@ -324,5 +363,25 @@ public class CandidateFeasibilityPlanner {
     /** {@code BigDecimal} → {@code double}；为 {@code null} 时给 {@code NaN}（＝未登记，不是 0）。 */
     private static double optionalDouble(BigDecimal value) {
         return value != null ? value.doubleValue() : Double.NaN;
+    }
+
+    /**
+     * 机巢允许机型串 → 机型列表：逐个 {@code trim} 并滤掉空串（评审 MEDIUM.18）。
+     *
+     * <p><b>为什么必须滤</b>：{@code CandidateGenerator} 用 {@code List.contains} +
+     * {@code String.equals} 做机型匹配。<b>未登记与登记成空串必须语义一致</b>——
+     * 台账里写 {@code "M30T, M400"}（逗号后带空格）时，{@code " M400"} 与机型名
+     * {@code "M400"} 不相等，该机型会被静默排除，现场表现为「机巢明明支持却不出候选」。
+     * 全空串（如 {@code ""}）拆出的是 {@code [""]}，会让「空 → 放行全部」和
+     * 「空 → 一个都不放行」两种口径打架，这里统一归一为<b>空列表＝未登记＝不限制机型</b>。
+     */
+    static List<String> splitModels(String supportedModels) {
+        if (supportedModels == null || supportedModels.isBlank()) {
+            return List.of();
+        }
+        return Arrays.stream(supportedModels.split(","))
+                .map(String::trim)
+                .filter(s -> !s.isEmpty())
+                .toList();
     }
 }
