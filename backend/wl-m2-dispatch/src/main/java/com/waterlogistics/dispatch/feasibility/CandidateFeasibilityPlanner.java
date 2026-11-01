@@ -330,10 +330,18 @@ public class CandidateFeasibilityPlanner {
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<NestEntity>()
                         .eq(NestEntity::getStatus, NEST_AVAILABLE));
 
-        double pickupLon = order.getShipLon() != null ? order.getShipLon().doubleValue() : 0.0;
-        double pickupLat = order.getShipLat() != null ? order.getShipLat().doubleValue() : 0.0;
-        double payloadKg = order.getGoodsWeight() != null
-                ? order.getGoodsWeight().doubleValue() : 0.0;
+        // 取货点与载荷缺失即快速失败（评审 MEDIUM.13，补丁：原先只修了 CandidateSelector，
+        // 但生产主路径是本类 selectFeasibleWithReasons（DispatchOrchestrator E3 接入），
+        // CandidateSelector 已无调用点——不补这里等于白修）：
+        // 原 0.0 兜底把取货点挪到 (0,0)，距离全 9000+ km，候选被 maxNestDistanceKm 全数过滤，
+        // 现场只看到「无可用候选组合，候选 0 条」（10-30 宋冰鑫异常告警复验实录），
+        // 真实原因（订单缺经纬度）被埋掉。宁可抛，让上游修数据。
+        requirePresentOrderField("ship_lon", order.getShipLon());
+        requirePresentOrderField("ship_lat", order.getShipLat());
+        requirePresentOrderField("goods_weight", order.getGoodsWeight());
+        double pickupLon = order.getShipLon().doubleValue();
+        double pickupLat = order.getShipLat().doubleValue();
+        double payloadKg = order.getGoodsWeight().doubleValue();
 
         List<CandidateInput.NestView> nestViews = new ArrayList<>();
         for (NestEntity nest : nests) {
@@ -363,6 +371,22 @@ public class CandidateFeasibilityPlanner {
     /** {@code BigDecimal} → {@code double}；为 {@code null} 时给 {@code NaN}（＝未登记，不是 0）。 */
     private static double optionalDouble(BigDecimal value) {
         return value != null ? value.doubleValue() : Double.NaN;
+    }
+
+    /**
+     * 订单必需字段缺失即抛（评审 MEDIUM.13）——不填 0.0 造出 (0, 0) 取货点。
+     *
+     * <p>与 {@code CandidateSelector} 同口径；本类是生产主路径（DispatchOrchestrator 走
+     * {@link #selectFeasibleWithReasons}），缺了这层守卫订单缺经纬度时只会表现为
+     * 「无可用候选组合」，真实原因被埋掉。
+     *
+     * @throws IllegalStateException 字段为 {@code null}
+     */
+    private static void requirePresentOrderField(String field, BigDecimal value) {
+        if (value == null) {
+            throw new IllegalStateException(
+                    "订单缺少必要字段 " + field + "，无法组装候选输入（不填 0 兜底，避免造出 (0,0) 取货点）");
+        }
     }
 
     /**

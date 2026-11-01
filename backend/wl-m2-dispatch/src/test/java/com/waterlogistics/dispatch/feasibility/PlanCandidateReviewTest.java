@@ -2,6 +2,7 @@ package com.waterlogistics.dispatch.feasibility;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.waterlogistics.contract.mq.WeatherData;
@@ -296,5 +297,32 @@ class PlanCandidateReviewTest {
             all.addAll(planner(drones, nest(s), 5.0).selectFeasibleWithReasons(order()).candidates());
         }
         assertEquals(4, all.size(), "四种空白写法都应视为「不限制机型」，各生成 1 个候选：" + all.size());
+    }
+
+    // ───────────── MEDIUM.13 · 补丁：生产主路径（planner）也要拦缺字段 ─────────────
+
+    /**
+     * 原修复只落在 {@code CandidateSelector}，但它已无调用点——DispatchOrchestrator 实际走
+     * 本类的 {@code selectFeasibleWithReasons}。旧 buildInput 对缺经纬度填 0.0，
+     * 取货点被挪到 (0,0)，距离 9000+ km 全被过滤，现场只看到「无可用候选组合，候选 0 条」
+     * （10-30 异常告警复验实录），真实原因被埋掉。本条锁定：planner 路径缺失即抛。
+     */
+    @Test
+    @DisplayName("MEDIUM.13：生产主路径 selectFeasibleWithReasons 遇订单缺 ship_lon 必须抛，不填 0 兜底")
+    void plannerPathRejectsOrderMissingShipLon() {
+        OrderTaskEntity missing = order();
+        missing.setShipLon(null);
+        IllegalStateException ex = assertThrows(IllegalStateException.class,
+                () -> planner(List.of(drone("UAV-01", "M30T", 12.0)), nest("M30T"), 5.0)
+                        .selectFeasibleWithReasons(missing));
+        assertTrue(ex.getMessage().contains("ship_lon"),
+                "异常消息要指明缺的是哪个字段，实际：" + ex.getMessage());
+
+        OrderTaskEntity missingWeight = order();
+        missingWeight.setGoodsWeight(null);
+        assertThrows(IllegalStateException.class,
+                () -> planner(List.of(drone("UAV-01", "M30T", 12.0)), nest("M30T"), 5.0)
+                        .selectFeasibleWithReasons(missingWeight),
+                "缺 goods_weight 同理必须抛");
     }
 }
