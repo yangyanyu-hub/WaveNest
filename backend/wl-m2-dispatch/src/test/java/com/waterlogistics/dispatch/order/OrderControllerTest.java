@@ -8,6 +8,7 @@ import com.waterlogistics.contract.rest.GateSource;
 import com.waterlogistics.contract.rest.GateStatus;
 import com.waterlogistics.dispatch.gate.DispatchGateService;
 import com.waterlogistics.dispatch.record.TaskLogRecorder;
+
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -30,8 +31,12 @@ class OrderControllerTest {
     @BeforeEach
     void setUp() {
         gateService = new DispatchGateService();
+        // 本测试只验 GET 回显，不触发 submit 链路：装配器/唤醒器传 null 即可
+        // （本模块测试无 Mockito，JDK 动态代理又只能代理接口，null 是最省的桩）
         controller = new OrderController(
-                new OrderAdmissionService(new TaskLogRecorder(), event -> { }), gateService);
+                new OrderAdmissionService(new TaskLogRecorder(), event -> { },
+                        null, null, null),
+                gateService);
     }
 
     @Test

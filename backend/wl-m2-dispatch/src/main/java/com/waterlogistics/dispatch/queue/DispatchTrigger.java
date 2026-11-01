@@ -65,6 +65,30 @@ public class DispatchTrigger {
     public void onOrderSubmitted(OrderSubmittedEvent event) {
         String orderId = event.orderId();
         try {
+            if (event.deferred()) {
+                // 阶段一 26：接单判定为「延后待唤醒」的单子——落库即「已受理待唤醒」，
+                // 不受理、不组批；唤醒由 AdmissionWakeScheduler（定时）或
+                // WeatherClearWaker（闸门解除）推回调度链
+                OrderTaskEntity deferred = new OrderTaskEntity();
+                deferred.setOrderId(orderId);
+                deferred.setShipMmsi(event.shipMmsi());
+                deferred.setGoodsWeight(event.goodsWeightDecimal());
+                deferred.setGoodsType(event.goodsType());
+                if (event.expectedTimeMs() != null) {
+                    deferred.setExpectedTime(LocalDateTime.ofInstant(
+                            Instant.ofEpochMilli(event.expectedTimeMs()), ZoneId.systemDefault()));
+                }
+                deferred.setPriority(event.priority());
+                deferred.setCreateTime(LocalDateTime.ofInstant(
+                        Instant.ofEpochMilli(event.submitTsMs()), ZoneId.systemDefault()));
+                deferred.setStatus(OrderStatus.ACCEPTED_WAIT_WAKE.getValue());
+                fillShipPosition(deferred);
+                orderTaskMapper.insert(deferred);
+                log.info("延后单落库：orderId={} waitReason={} wakeEtaTs={}",
+                        orderId, event.waitReason(), event.wakeEtaTs());
+                return;
+            }
+
             // 1. 落库 order_task（待受理）——OrderAdmissionService 只存内存，落库由 queue 负责
             OrderTaskEntity entity = new OrderTaskEntity();
             entity.setOrderId(orderId);

@@ -77,6 +77,26 @@ wavenest:
         min-lat: 28.660
         max-lat: 28.767
 
+    admission:
+      # 阶段一 26 接单判定（AdmissionPipeline）的判据参数。台账化的服务航段表未建
+      # （80 §5.5 待补），航段折线以《73》§3.1 定稿服务航段配置代替；建表后改读表。
+      # 航段折线「lon,lat;lon,lat;…」：朝阳大桥 → 汉帮洲中段 → 八一大桥
+      segment-vertices: "115.852,28.646;115.859,28.663;115.879,28.692"
+      segment-start-m: 0
+      segment-end-m: 0            # 0＝取折线全长（服务航段＝整条演示航段）
+      corridor-half-width-m: 50   # 走廊半宽：垂距超出即「不在段内」，与预测侧 lane-half-width-m 同源
+      cargo-whitelist: 医疗物资,应急药品,食品,生活物资
+      max-payload-all-types-kg: 50.0
+      max-payload-margin: 0.1     # 上界裕度：有效上界＝50×0.9＝45 kg
+      ttl-ais-ms: 10000           # AIS 1 Hz，10 s 无有效观测即「数据不足」延后
+      v-max-cruise-ms: 6.0        # 与预测侧 v-max-craft-ms 同源
+      t-handover-min-sec: 60
+      wake-margin-sec: 60         # 等船唤醒提前量：tEnter − 60 s 唤醒
+      suspend-retry-sec: 60       # 数据不足／未进段的重评周期
+      horizon-sec: 1800           # 与预测侧 horizonSec 同源
+      weight-tol-kg: 0.5          # 重复单重量容差
+      dup-window-sec: 300         # 重复单时间窗
+
 logging:
   level:
     root: INFO
