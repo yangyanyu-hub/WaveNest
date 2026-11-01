@@ -12,6 +12,7 @@ import java.util.List;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -58,8 +59,11 @@ public class WeatherClearWaker {
         return thread;
     });
 
-    /** 上一轮闸门是否打开（边沿检测记忆位） */
-    private volatile boolean lastOpen;
+    /** 上一轮闸门是否打开（边沿检测记忆位；只有唤醒成功后才推进） */
+    private final AtomicBoolean lastOpen = new AtomicBoolean(false);
+
+    /** 边沿占位：同一时刻只允许一个线程执行积压唤醒 */
+    private final AtomicBoolean waking = new AtomicBoolean(false);
 
     @Value("${wavenest.mq.wake-poll-enabled:true}")
     private boolean pollEnabled;
@@ -77,15 +81,21 @@ public class WeatherClearWaker {
 
     @PostConstruct
     void start() {
-        lastOpen = gateService.isOpen();
+        boolean initialOpen = gateService.isOpen();
+        lastOpen.set(initialOpen);
         if (!pollEnabled) {
             log.info("气象解除积压唤醒轮询未启用（wavenest.mq.wake-poll-enabled=false）");
             return;
         }
+        if (initialOpen) {
+            // 起始即打开：启动前可能已积压一批订单，先补扫一轮，补扫完成再进边沿轮询
+            lastOpen.set(false);
+            tickSafely();
+        }
         scheduler.scheduleWithFixedDelay(this::tickSafely,
                 pollIntervalSec, pollIntervalSec, TimeUnit.SECONDS);
         log.info("气象解除积压唤醒轮询已启动：间隔 {}s，起始闸门状态={}",
-                pollIntervalSec, lastOpen ? "打开" : "熔断");
+                pollIntervalSec, lastOpen.get() ? "打开" : "熔断");
     }
 
     @PreDestroy
@@ -96,17 +106,36 @@ public class WeatherClearWaker {
     /**
      * 轮询一拍：检测 {@code 关闭 → 打开} 边沿，命中即唤醒积压。
      * 公开供测试与运维手动触发（幂等，未命中边沿时无事发生）。
+     *
+     * <p><b>开口状态只在唤醒成功后推进</b>：唤醒抛异常时记忆位回滚为「熔断」，
+     * 下一拍还会命中同一边沿、积压可重试，不会因为一次失败丢掉整批订单。
      */
     public void tick() {
-        boolean open = gateService.isOpen();
-        boolean wasOpen = lastOpen;
-        lastOpen = open;
-        if (!open || wasOpen) {
+        if (!gateService.isOpen()) {
+            lastOpen.set(false);
             return;
         }
-        int woken = wakeBacklog();
-        if (woken > 0) {
-            log.info("闸门解除边沿命中：唤醒积压订单 {} 笔（已受理待唤醒 → 重入队并续编排）", woken);
+        if (lastOpen.get()) {
+            return;
+        }
+        if (!waking.compareAndSet(false, true)) {
+            return;
+        }
+        try {
+            // 双检：等占位期间别的线程可能已完成本轮唤醒
+            if (lastOpen.get()) {
+                return;
+            }
+            int woken = wakeBacklog();
+            lastOpen.set(true);
+            if (woken > 0) {
+                log.info("闸门解除边沿命中：唤醒积压订单 {} 笔（已受理待唤醒 → 重入队并续编排）", woken);
+            }
+        } catch (RuntimeException e) {
+            lastOpen.set(false);
+            throw e;
+        } finally {
+            waking.set(false);
         }
     }
 

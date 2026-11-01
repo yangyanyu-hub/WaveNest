@@ -18,9 +18,10 @@ import com.waterlogistics.storage.repository.TaskLogMapper;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Set;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.amqp.core.ExchangeTypes;
@@ -86,8 +87,17 @@ public class AlertDrivenDispatcher {
     /** 反查在飞订单（自带「已飞完」判据），口径见 {@link #resolveOrderId}。 */
     private final FlightPhaseAdvancer flightPhaseAdvancer;
 
-    /** 已复核过的告警事件 id（返航复核按 eventId 去重，见类注释） */
-    private final Set<String> reviewedEventIds = ConcurrentHashMap.newKeySet();
+    /** 已复核过的告警事件 id 上限（LRU 有界，覆盖告警重投窗口即可） */
+    private static final int REVIEWED_EVENT_CAPACITY = 1024;
+
+    /** 已复核过的告警事件 id（eventId 幂等；有界 LRU，见 {@link #claimEvent}） */
+    private final Map<String, Boolean> reviewedEventIds = Collections.synchronizedMap(
+            new LinkedHashMap<>(16, 0.75f, true) {
+                @Override
+                protected boolean removeEldestEntry(Map.Entry<String, Boolean> eldest) {
+                    return size() > REVIEWED_EVENT_CAPACITY;
+                }
+            });
 
     public AlertDrivenDispatcher(RescheduleService rescheduleService,
             HomecomingService homecomingService,
@@ -147,49 +157,92 @@ public class AlertDrivenDispatcher {
 
     /** 分派表第 1 行：偏航 → 重调度（重入队 ＋ 派发编排）。 */
     private void handleDeviation(AlertEventMessage message) {
-        String orderId = resolveOrderId(message);
-        if (orderId == null) {
-            log.warn("偏航告警缺订单号（消息未带且按机号反查未命中），无法重调度：eventId={} droneId={}",
-                    message.eventId(), message.droneId());
+        if (!claimEvent(message.eventId())) {
+            log.info("同一告警事件已重调度过，去重跳过：eventId={}", message.eventId());
             return;
         }
-        String newDroneId = rescheduleService.reschedule(orderId);
-        log.info("偏航告警触发重调度完成：orderId={} 新机={} eventId={}",
-                orderId, newDroneId, message.eventId());
+        boolean done = false;
+        try {
+            String orderId = resolveOrderId(message);
+            if (orderId == null) {
+                log.warn("偏航告警缺订单号（消息未带且按机号反查未命中），无法重调度：eventId={} droneId={}",
+                        message.eventId(), message.droneId());
+                return;
+            }
+            String newDroneId = rescheduleService.reschedule(orderId);
+            log.info("偏航告警触发重调度完成：orderId={} 新机={} eventId={}",
+                    orderId, newDroneId, message.eventId());
+            done = true;
+        } finally {
+            if (!done) {
+                releaseEvent(message.eventId());
+            }
+        }
     }
 
     /** 分派表第 2 行：低电量／失联 → 返航复核（决策落审计 ＋ 广播，下游不接实）。 */
     private void handleHomecoming(AlertEventMessage message) {
-        String orderId = resolveOrderId(message);
-        if (orderId == null) {
-            log.warn("告警缺订单号（失联早于订单绑定属正常；按机号反查亦未命中），无法返航复核：eventId={} type={}",
-                    message.eventId(), message.alertType());
-            return;
-        }
-        if (!reviewedEventIds.add(message.eventId())) {
+        if (!claimEvent(message.eventId())) {
             log.info("同一告警事件已复核过，去重跳过：eventId={}", message.eventId());
             return;
         }
-        OrderTaskEntity order = orderTaskMapper.selectById(orderId);
-        if (order == null) {
-            log.warn("返航复核跳过：订单不存在 orderId={} eventId={}",
-                    orderId, message.eventId());
-            return;
+        boolean done = false;
+        try {
+            String orderId = resolveOrderId(message);
+            if (orderId == null) {
+                log.warn("告警缺订单号（失联早于订单绑定属正常；按机号反查亦未命中），无法返航复核：eventId={} type={}",
+                        message.eventId(), message.alertType());
+                return;
+            }
+            OrderTaskEntity order = orderTaskMapper.selectById(orderId);
+            if (order == null) {
+                log.warn("返航复核跳过：订单不存在 orderId={} eventId={}",
+                        orderId, message.eventId());
+                return;
+            }
+            HomecomingInput input = assembler.build(message, order,
+                    message.droneId() == null ? null : droneMapper.selectById(message.droneId()));
+            if (input == null) {
+                return;
+            }
+            HomecomingParams params = assembler.params();
+            // 候选他巢台账传空：第二级需 B 组返程能耗精算，未接——降级到一／三级，不伪造能耗
+            HomecomingDecision decision = homecomingService.reviewAndDecide(input, params, List.of());
+            writeAudit(order, message, decision);
+            eventPublisher.publishEvent(new HomecomingDecisionEvent(
+                    message.eventId(), message.alertType(), order.getOrderId(), message.droneId(),
+                    decision.tier(), decision.targetId(), decision.needSlotRequest(), decision.reason()));
+            log.info("告警驱动返航复核完成：orderId={} tier={} eventId={}",
+                    order.getOrderId(), decision.tier().getValue(), message.eventId());
+            done = true;
+        } finally {
+            if (!done) {
+                releaseEvent(message.eventId());
+            }
         }
-        HomecomingInput input = assembler.build(message, order,
-                message.droneId() == null ? null : droneMapper.selectById(message.droneId()));
-        if (input == null) {
-            return;
+    }
+
+    /**
+     * 占位：同一 eventId 只处理一次（级别变化复用 id 再发时去重）。
+     *
+     * <p><b>先占位再干活</b>防止并发重复处理；<b>只有产出结果才保留</b>——
+     * 提前返回或抛异常时由 {@link #releaseEvent} 释放，让该事件重投后还能再处理一次。
+     */
+    private boolean claimEvent(String eventId) {
+        synchronized (reviewedEventIds) {
+            if (reviewedEventIds.containsKey(eventId)) {
+                return false;
+            }
+            reviewedEventIds.put(eventId, Boolean.TRUE);
+            return true;
         }
-        HomecomingParams params = assembler.params();
-        // 候选他巢台账传空：第二级需 B 组返程能耗精算，未接——降级到一／三级，不伪造能耗
-        HomecomingDecision decision = homecomingService.reviewAndDecide(input, params, List.of());
-        writeAudit(order, message, decision);
-        eventPublisher.publishEvent(new HomecomingDecisionEvent(
-                message.eventId(), message.alertType(), order.getOrderId(), message.droneId(),
-                decision.tier(), decision.targetId(), decision.needSlotRequest(), decision.reason()));
-        log.info("告警驱动返航复核完成：orderId={} tier={} eventId={}",
-                order.getOrderId(), decision.tier().getValue(), message.eventId());
+    }
+
+    /** 释放未经处理的占位（LRU 有界，容量见 {@link #REVIEWED_EVENT_CAPACITY}）。 */
+    private void releaseEvent(String eventId) {
+        synchronized (reviewedEventIds) {
+            reviewedEventIds.remove(eventId);
+        }
     }
 
     /**
