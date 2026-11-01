@@ -8,6 +8,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 调度结果展示的<b>纯聚合逻辑</b>（M2 · 卢肄文 · 10-22 任务 D3）。
@@ -220,6 +221,41 @@ public final class MonitorAggregator {
         }
 
         return new StatisticsResponse(total, byStatus, dispatched, inFlight, finished, terminal,
+                taskLogCount, lastOrderAt);
+    }
+
+    /** 数据库聚合行 → 统计响应，避免监控统计加载全表订单。 */
+    public static StatisticsResponse toStatistics(Map<String, Long> counts, long taskLogCount,
+            LocalDateTime lastOrderAt) {
+        Map<String, Long> rows = counts == null ? Map.of() : counts;
+        List<StatusCount> byStatus = new ArrayList<>(OrderStatus.values().length + 1);
+        long total = 0, unknown = 0, dispatched = 0, inFlight = 0, finished = 0, terminal = 0;
+        for (Map.Entry<String, Long> row : rows.entrySet()) {
+            long count = row.getValue() == null ? 0 : row.getValue();
+            total += count;
+            OrderStatus status = parse(row.getKey());
+            if (status == null) {
+                unknown += count;
+            } else if (status == OrderStatus.DISPATCHED) {
+                dispatched += count;
+            } else if (status == OrderStatus.OUTBOUND || status == OrderStatus.HANDOVER
+                    || status == OrderStatus.RETURNING) {
+                inFlight += count;
+            } else if (status == OrderStatus.FINISHED) {
+                finished += count;
+            } else if (status.isTerminal()) {
+                terminal += count;
+            }
+        }
+        for (OrderStatus status : OrderStatus.values()) {
+            byStatus.add(new StatusCount(status.name(), status.getValue(),
+                    Math.toIntExact(rows.getOrDefault(status.getValue(), 0L))));
+        }
+        if (unknown > 0) {
+            byStatus.add(new StatusCount(UNKNOWN_CODE, UNKNOWN_LABEL, Math.toIntExact(unknown)));
+        }
+        return new StatisticsResponse(Math.toIntExact(total), byStatus, Math.toIntExact(dispatched),
+                Math.toIntExact(inFlight), Math.toIntExact(finished), Math.toIntExact(terminal),
                 taskLogCount, lastOrderAt);
     }
 

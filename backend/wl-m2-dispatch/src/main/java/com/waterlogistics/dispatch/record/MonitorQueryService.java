@@ -1,17 +1,20 @@
 package com.waterlogistics.dispatch.record;
 
 import com.waterlogistics.storage.entity.OrderTaskEntity;
-import com.waterlogistics.storage.entity.TaskLogEntity;
 import com.waterlogistics.storage.repository.OrderTaskMapper;
 import com.waterlogistics.storage.repository.TaskLogMapper;
+import com.baomidou.mybatisplus.core.conditions.query.QueryWrapper;
+import java.time.LocalDateTime;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 /**
  * 调度结果展示的查询服务（M2 · 卢肄文 · 10-22 任务 D3）。
  *
- * <p>只做「取数 → 交给 {@link MonitorAggregator} 聚合」这一层，<b>不含任何口径</b>：
- * 字段映射、排序、计数全在纯聚合器里，这样口径可单测、本类只剩一次查库。
+ * <p>列表只读取请求页；统计在数据库聚合后交给 {@link MonitorAggregator} 统一映射状态口径。
  *
  * <h3>数据来源（按清单要求：走已有持久层，不新造表）</h3>
  * <ul>
@@ -24,13 +27,19 @@ import org.springframework.stereotype.Service;
  */
 @Service
 public class MonitorQueryService {
+    /** 默认 50 行，最多 200 行；页码从 1 开始。 */
+    static final int DEFAULT_PAGE_SIZE = 50;
+    static final int MAX_PAGE_SIZE = 200;
 
     private final OrderTaskMapper orderTaskMapper;
     private final TaskLogMapper taskLogMapper;
+    private final JdbcTemplate jdbcTemplate;
 
-    public MonitorQueryService(OrderTaskMapper orderTaskMapper, TaskLogMapper taskLogMapper) {
+    public MonitorQueryService(OrderTaskMapper orderTaskMapper, TaskLogMapper taskLogMapper,
+            JdbcTemplate jdbcTemplate) {
         this.orderTaskMapper = orderTaskMapper;
         this.taskLogMapper = taskLogMapper;
+        this.jdbcTemplate = jdbcTemplate;
     }
 
     /**
@@ -39,7 +48,19 @@ public class MonitorQueryService {
      * @return 列表响应；空库返回 {@code total=0} 的空列表
      */
     public MonitorAggregator.TasksResponse tasks() {
-        return MonitorAggregator.toTasksResponse(selectAllOrders());
+        return tasks(1, DEFAULT_PAGE_SIZE);
+    }
+
+    public MonitorAggregator.TasksResponse tasks(int page, int size) {
+        int boundedPage = Math.max(1, page);
+        int boundedSize = Math.max(1, Math.min(size, MAX_PAGE_SIZE));
+        long offset = ((long) boundedPage - 1) * boundedSize;
+        // 只取请求页，使用主键打破相同 create_time 的排序并保持翻页稳定。
+        QueryWrapper<OrderTaskEntity> query = new QueryWrapper<OrderTaskEntity>()
+                .orderByDesc("create_time", "order_id")
+                .last("LIMIT " + offset + ", " + boundedSize);
+        List<OrderTaskEntity> orders = orderTaskMapper.selectList(query);
+        return MonitorAggregator.toTasksResponse(orders == null ? List.of() : orders);
     }
 
     /**
@@ -48,14 +69,14 @@ public class MonitorQueryService {
      * @return 统计响应；空库时各计数为 0
      */
     public MonitorAggregator.StatisticsResponse statistics() {
-        List<OrderTaskEntity> orders = selectAllOrders();
+        Map<String, Long> counts = jdbcTemplate.query(
+                "SELECT status, COUNT(*) AS amount FROM order_task GROUP BY status",
+                (rs, rowNum) -> Map.entry(rs.getString("status") == null ? "" : rs.getString("status"),
+                        rs.getLong("amount"))).stream()
+                .collect(Collectors.toMap(Map.Entry::getKey, Map.Entry::getValue));
+        LocalDateTime lastOrderAt = jdbcTemplate.queryForObject(
+                "SELECT MAX(create_time) FROM order_task", LocalDateTime.class);
         Long logCount = taskLogMapper.selectCount(null);
-        return MonitorAggregator.toStatistics(orders, logCount == null ? 0L : logCount);
-    }
-
-    /** 全量订单行；排序由聚合器负责（保持"排序口径只有一个地方"）。 */
-    private List<OrderTaskEntity> selectAllOrders() {
-        List<OrderTaskEntity> orders = orderTaskMapper.selectList(null);
-        return orders == null ? List.of() : orders;
+        return MonitorAggregator.toStatistics(counts, logCount == null ? 0L : logCount, lastOrderAt);
     }
 }

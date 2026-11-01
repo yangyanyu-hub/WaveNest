@@ -5,10 +5,12 @@ import com.waterlogistics.storage.repository.TaskLogMapper;
 import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
-import java.util.ArrayList;
+import java.util.ArrayDeque;
+import java.util.Deque;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -42,11 +44,15 @@ public class TaskLogRecorder {
 
     /** 事件流上限：仅内存副本用，防止长时间运行无限增长（落库那份不受此限）。 */
     private static final int MAX_ENTRIES = 5_000;
+    private static final int MAX_TRACKED_ORDERS = 1_000;
+    private static final ZoneId DB_ZONE = ZoneId.of("Asia/Shanghai");
+    private static final long WARN_INTERVAL_MS = 60_000;
 
     /** 落库出口；{@code null} 表示只落内存（不依赖 Spring/DB 的单测场景）。 */
     private final TaskLogMapper taskLogMapper;
 
-    private final Map<String, List<TaskLogEntry>> entriesByOrder = new ConcurrentHashMap<>();
+    private final Map<String, Deque<TaskLogEntry>> entriesByOrder = new LinkedHashMap<>();
+    private final AtomicLong lastPersistWarningMs = new AtomicLong(Long.MIN_VALUE);
 
     /** 供不依赖 Spring 与数据库的单测使用（只落内存）。 */
     public TaskLogRecorder() {
@@ -68,15 +74,24 @@ public class TaskLogRecorder {
      * @param tsMs       发生时刻，Unix 毫秒
      */
     public void record(String orderId, String opType, String fromStatus, String toStatus, long tsMs) {
+        requireText(orderId, "orderId");
+        requireText(opType, "opType");
+        requireText(toStatus, "toStatus");
         TaskLogEntry entry = new TaskLogEntry(orderId, opType, fromStatus, toStatus, tsMs);
 
-        List<TaskLogEntry> entries =
-                entriesByOrder.computeIfAbsent(orderId, key -> new ArrayList<>());
-        synchronized (entries) {
-            if (entries.size() >= MAX_ENTRIES) {
-                entries.remove(0);
+        synchronized (entriesByOrder) {
+            Deque<TaskLogEntry> entries = entriesByOrder.get(orderId);
+            if (entries == null) {
+                if (entriesByOrder.size() >= MAX_TRACKED_ORDERS) {
+                    entriesByOrder.remove(entriesByOrder.keySet().iterator().next());
+                }
+                entries = new ArrayDeque<>();
+                entriesByOrder.put(orderId, entries);
             }
-            entries.add(entry);
+            if (entries.size() >= MAX_ENTRIES) {
+                entries.removeFirst();
+            }
+            entries.addLast(entry);
         }
 
         log.info("task_log：orderId={} op={} {} -> {} ts={}",
@@ -87,18 +102,18 @@ public class TaskLogRecorder {
 
     /** 取某订单的事件流快照（按发生顺序）。 */
     public List<TaskLogEntry> entriesOf(String orderId) {
-        List<TaskLogEntry> entries = entriesByOrder.get(orderId);
-        if (entries == null) {
-            return List.of();
-        }
-        synchronized (entries) {
-            return List.copyOf(entries);
+        requireText(orderId, "orderId");
+        synchronized (entriesByOrder) {
+            Deque<TaskLogEntry> entries = entriesByOrder.get(orderId);
+            return entries == null ? List.of() : List.copyOf(entries);
         }
     }
 
     /** 已记录事件的订单数。 */
     public int trackedOrderCount() {
-        return entriesByOrder.size();
+        synchronized (entriesByOrder) {
+            return entriesByOrder.size();
+        }
     }
 
     /** 持久化到 {@code task_log}；失败只告警，不影响调度主流程。 */
@@ -113,11 +128,23 @@ public class TaskLogRecorder {
             entity.setFromStatus(entry.fromStatus());
             entity.setToStatus(entry.toStatus());
             entity.setTs(LocalDateTime.ofInstant(
-                    Instant.ofEpochMilli(entry.tsMs()), ZoneId.systemDefault()));
+                    Instant.ofEpochMilli(entry.tsMs()), DB_ZONE));
             taskLogMapper.insert(entity);
         } catch (Exception e) {
-            log.warn("task_log 落库失败（不阻断主流程）：orderId={} op={} err={}",
-                    entry.orderId(), entry.opType(), e.getMessage());
+            long now = System.currentTimeMillis();
+            long previous = lastPersistWarningMs.get();
+            if (previous == Long.MIN_VALUE || now - previous >= WARN_INTERVAL_MS) {
+                if (lastPersistWarningMs.compareAndSet(previous, now)) {
+                    log.warn("task_log 落库失败（不阻断主流程）：orderId={} op={}",
+                            entry.orderId(), entry.opType(), e);
+                }
+            }
+        }
+    }
+
+    private static void requireText(String value, String name) {
+        if (value == null || value.isBlank()) {
+            throw new IllegalArgumentException(name + " must not be blank");
         }
     }
 
