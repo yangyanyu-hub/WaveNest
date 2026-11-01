@@ -11,9 +11,6 @@ import com.waterlogistics.storage.repository.NestMapper;
 import com.waterlogistics.storage.param.SysParamLoader;
 import org.springframework.stereotype.Service;
 
-import java.math.BigDecimal;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.List;
 
 /**
@@ -84,79 +81,9 @@ public class CandidateSelector {
     private CandidateInput buildInput(OrderTaskEntity order,
                                       List<DroneEntity> drones,
                                       List<NestEntity> nests) {
-        // 取货点与载荷缺失即快速失败（评审 MEDIUM.13）：
-        // 原实现给 0.0，等于把取货点挪到几内亚湾 (0,0)，算出的距离全是 9000+ km，
-        // 候选被 maxNestDistanceKm 全数过滤 —— 现场只看到「无可用候选」，
-        // 真实原因（订单缺经纬度）被埋掉。宁可抛，让上游修数据。
-        requirePresentOrderField("ship_lon", order.getShipLon());
-        requirePresentOrderField("ship_lat", order.getShipLat());
-        requirePresentOrderField("goods_weight", order.getGoodsWeight());
-        double pickupLon = order.getShipLon().doubleValue();
-        double pickupLat = order.getShipLat().doubleValue();
-        double payloadKg = order.getGoodsWeight().doubleValue();
-
-        List<CandidateInput.NestView> nestViews = new ArrayList<>();
-        for (NestEntity n : nests) {
-            nestViews.add(new CandidateInput.NestView(
-                n.getNestId(),
-                n.getLon() != null ? n.getLon().doubleValue() : 0.0,
-                n.getLat() != null ? n.getLat().doubleValue() : 0.0,
-                splitModels(n.getSupportedModels())));
-        }
-
-        List<CandidateInput.DroneView> droneViews = new ArrayList<>();
-        for (DroneEntity d : drones) {
-            droneViews.add(new CandidateInput.DroneView(
-                d.getDroneId(),
-                d.getCurrentNestId() != null ? d.getCurrentNestId() : d.getHomeNestId(),
-                d.getModel(),
-                d.getStatus(),
-                // battery/maxPayload 缺失按 0.0 处理是有意的保守策略（Open CodeReview 质疑后立此存照）：
-                // 缺数据 ⇒ 当作"没电/载不动" ⇒ 被闸自然淘汰，方向安全。
-                // 切不可学 windLimit 的 NaN 口径——NaN 参与 > / < 比较恒 false，
-                // 会让没电的机器通过电量闸（那才是危险方向）。缺失数据在台账里补。
-                d.getBattery() != null ? d.getBattery().doubleValue() : 0.0,
-                d.getMaxPayload() != null ? d.getMaxPayload().doubleValue() : 0.0,
-                // 机型能力两列（10-20 B1）：DB 缺失时给 NaN 表示"未登记"，
-                // 由 FeasibilityJudge 按回退口径处理——这里既不臆造 0，也不填默认值冒充真值
-                optionalDouble(d.getWindLimitMs()),
-                optionalDouble(d.getCruiseSpeedMs())));
-        }
-
-        return new CandidateInput(pickupLon, pickupLat, payloadKg, nestViews, droneViews);
-    }
-
-    /** {@code BigDecimal} → {@code double}；为 {@code null} 时给 {@code NaN}（＝未登记） */
-    private static double optionalDouble(BigDecimal v) {
-        return v != null ? v.doubleValue() : Double.NaN;
-    }
-
-    /**
-     * 订单必需字段缺失即抛（评审 MEDIUM.13）——不填 0.0 造出 (0, 0) 取货点。
-     *
-     * @throws IllegalStateException 字段为 {@code null}
-     */
-    private static void requirePresentOrderField(String field, BigDecimal value) {
-        if (value == null) {
-            throw new IllegalStateException(
-                    "订单缺少必要字段 " + field + "，无法组装候选输入（不填 0 兜底，避免造出 (0,0) 取货点）");
-        }
-    }
-
-    /**
-     * 机巢允许机型串 → 机型列表：逐个 {@code trim} 并滤掉空串（评审 HIGH.7）。
-     *
-     * <p>不 trim 的后果：台账写 {@code "M30T, M400"} 时拆出 {@code " M400"}，
-     * 与机型名 {@code "M400"} 用 {@code equals} 比较不等，该机型被静默排除，
-     * 现场表现为「机巢明明支持却不出候选」。归一为空列表时表示「未登记、不限制机型」。
-     */
-    private static List<String> splitModels(String supportedModels) {
-        if (supportedModels == null || supportedModels.isBlank()) {
-            return List.of();
-        }
-        return Arrays.stream(supportedModels.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .toList();
+        // 组装逻辑收敛到 CandidateInputAssembler（Open CodeReview：两份同源副本
+        // 必须收敛成一份，否则每次评审修复都要改两处漏一处）。mapper 查询口径
+        // （status=空闲 + health_status=健康）仍留在本类。
+        return CandidateInputAssembler.assemble(order, drones, nests);
     }
 }

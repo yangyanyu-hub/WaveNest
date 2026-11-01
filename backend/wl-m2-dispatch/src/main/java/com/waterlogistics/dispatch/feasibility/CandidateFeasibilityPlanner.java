@@ -15,7 +15,6 @@ import com.waterlogistics.storage.repository.DroneMapper;
 import com.waterlogistics.storage.repository.NestMapper;
 import java.math.BigDecimal;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -240,8 +239,9 @@ public class CandidateFeasibilityPlanner {
                     weatherSettings.ttlMs(), fallbackWindMs);
         }
 
-        double payloadKg = order.getGoodsWeight() != null
-                ? order.getGoodsWeight().doubleValue() : 0.0;
+        // 载荷直接取组装产物（Open CodeReview：这里原有一份独立的 0.0 兜底，
+        // 与 buildInput 的守卫重复且会漂移——单一事实源是 CandidateInput.payloadKg()）
+        double payloadKg = input.payloadKg();
 
         FeasibleCandidatePicker.Selection selection = FeasibleCandidatePicker.pick(
                 combos, worstWindMs, payloadKg, judgeParams(input));
@@ -330,84 +330,10 @@ public class CandidateFeasibilityPlanner {
                 new com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper<NestEntity>()
                         .eq(NestEntity::getStatus, NEST_AVAILABLE));
 
-        // 取货点与载荷缺失即快速失败（评审 MEDIUM.13，补丁：原先只修了 CandidateSelector，
-        // 但生产主路径是本类 selectFeasibleWithReasons（DispatchOrchestrator E3 接入），
-        // CandidateSelector 已无调用点——不补这里等于白修）：
-        // 原 0.0 兜底把取货点挪到 (0,0)，距离全 9000+ km，候选被 maxNestDistanceKm 全数过滤，
-        // 现场只看到「无可用候选组合，候选 0 条」（10-30 宋冰鑫异常告警复验实录），
-        // 真实原因（订单缺经纬度）被埋掉。宁可抛，让上游修数据。
-        requirePresentOrderField("ship_lon", order.getShipLon());
-        requirePresentOrderField("ship_lat", order.getShipLat());
-        requirePresentOrderField("goods_weight", order.getGoodsWeight());
-        double pickupLon = order.getShipLon().doubleValue();
-        double pickupLat = order.getShipLat().doubleValue();
-        double payloadKg = order.getGoodsWeight().doubleValue();
-
-        List<CandidateInput.NestView> nestViews = new ArrayList<>();
-        for (NestEntity nest : nests) {
-            nestViews.add(new CandidateInput.NestView(
-                    nest.getNestId(),
-                    nest.getLon() != null ? nest.getLon().doubleValue() : 0.0,
-                    nest.getLat() != null ? nest.getLat().doubleValue() : 0.0,
-                    splitModels(nest.getSupportedModels())));
-        }
-
-        List<CandidateInput.DroneView> droneViews = new ArrayList<>();
-        for (DroneEntity drone : drones) {
-            droneViews.add(new CandidateInput.DroneView(
-                    drone.getDroneId(),
-                    drone.getCurrentNestId() != null ? drone.getCurrentNestId() : drone.getHomeNestId(),
-                    drone.getModel(),
-                    drone.getStatus(),
-                    // battery/maxPayload 缺失按 0.0＝有意保守（缺数据当"没电/载不动"，被闸淘汰），
-                    // 不学 windLimit 的 NaN 口径——NaN 参与比较恒 false 会放过没电的机（与 CandidateSelector 同注）
-                    drone.getBattery() != null ? drone.getBattery().doubleValue() : 0.0,
-                    drone.getMaxPayload() != null ? drone.getMaxPayload().doubleValue() : 0.0,
-                    optionalDouble(drone.getWindLimitMs()),
-                    optionalDouble(drone.getCruiseSpeedMs())));
-        }
-
-        return new CandidateInput(pickupLon, pickupLat, payloadKg, nestViews, droneViews);
-    }
-
-    /** {@code BigDecimal} → {@code double}；为 {@code null} 时给 {@code NaN}（＝未登记，不是 0）。 */
-    private static double optionalDouble(BigDecimal value) {
-        return value != null ? value.doubleValue() : Double.NaN;
-    }
-
-    /**
-     * 订单必需字段缺失即抛（评审 MEDIUM.13）——不填 0.0 造出 (0, 0) 取货点。
-     *
-     * <p>与 {@code CandidateSelector} 同口径；本类是生产主路径（DispatchOrchestrator 走
-     * {@link #selectFeasibleWithReasons}），缺了这层守卫订单缺经纬度时只会表现为
-     * 「无可用候选组合」，真实原因被埋掉。
-     *
-     * @throws IllegalStateException 字段为 {@code null}
-     */
-    private static void requirePresentOrderField(String field, BigDecimal value) {
-        if (value == null) {
-            throw new IllegalStateException(
-                    "订单缺少必要字段 " + field + "，无法组装候选输入（不填 0 兜底，避免造出 (0,0) 取货点）");
-        }
-    }
-
-    /**
-     * 机巢允许机型串 → 机型列表：逐个 {@code trim} 并滤掉空串（评审 MEDIUM.18）。
-     *
-     * <p><b>为什么必须滤</b>：{@code CandidateGenerator} 用 {@code List.contains} +
-     * {@code String.equals} 做机型匹配。<b>未登记与登记成空串必须语义一致</b>——
-     * 台账里写 {@code "M30T, M400"}（逗号后带空格）时，{@code " M400"} 与机型名
-     * {@code "M400"} 不相等，该机型会被静默排除，现场表现为「机巢明明支持却不出候选」。
-     * 全空串（如 {@code ""}）拆出的是 {@code [""]}，会让「空 → 放行全部」和
-     * 「空 → 一个都不放行」两种口径打架，这里统一归一为<b>空列表＝未登记＝不限制机型</b>。
-     */
-    static List<String> splitModels(String supportedModels) {
-        if (supportedModels == null || supportedModels.isBlank()) {
-            return List.of();
-        }
-        return Arrays.stream(supportedModels.split(","))
-                .map(String::trim)
-                .filter(s -> !s.isEmpty())
-                .toList();
+        // 组装逻辑收敛到 CandidateInputAssembler（Open CodeReview：两份同源副本
+        // 必须收敛成一份）。mapper 查询口径（空闲＋健康 / 巢可用）仍留在本类。
+        // MEDIUM.13 守卫（缺经纬度/载重即抛）随组装器生效——生产主路径由此受保护。
+        return com.waterlogistics.dispatch.candidate.CandidateInputAssembler
+                .assemble(order, drones, nests);
     }
 }
