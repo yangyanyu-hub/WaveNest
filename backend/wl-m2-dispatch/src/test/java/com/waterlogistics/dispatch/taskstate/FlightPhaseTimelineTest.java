@@ -37,6 +37,16 @@ class FlightPhaseTimelineTest {
     }
 
     @Test
+    @DisplayName("审计时刻钳制：到期时刻早于下界时顺延，保证日志时间不倒挂")
+    void auditTs_shouldNeverGoBackwards() {
+        assertEquals(MEET, FlightPhaseTimeline.auditTs(MEET, MEET - 1_000L), "到期更晚时取到期时刻");
+        assertEquals(MEET, FlightPhaseTimeline.auditTs(MEET, 0L), "无下界时取到期时刻");
+        assertEquals(MEET + 1L, FlightPhaseTimeline.auditTs(MEET, MEET), "与下界相等也必须前进一格");
+        assertEquals(MEET + 1L, FlightPhaseTimeline.auditTs(MEET - 5_000L, MEET),
+                "已晚写过的时刻不得被更早的理论到期值覆盖");
+    }
+
+    @Test
     @DisplayName("输入非法时拒绝，不生成负时长时间表")
     void schedule_shouldRejectInvalidInput() {
         assertThrows(IllegalArgumentException.class,

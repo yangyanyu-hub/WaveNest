@@ -13,7 +13,12 @@ package com.waterlogistics.dispatch.prediction;
  *   <li>依赖方向仍满足《包结构设计》§二：M2 调 M3 只经门面，<b>不碰 solver 内部类</b>。</li>
  * </ul>
  *
- * <p>当前默认实现见 {@link LoggingRecomputeRequester}（只留痕，不真调求解）。
+ * <p><b>装配规则（LOW.23，防 {@code NoUniqueBeanDefinitionException}）</b>：容器内允许存在多个实现，
+ * 但注入点必须唯一确定——业务实现标注 {@code @Primary}，默认实现 {@link LoggingRecomputeRequester}
+ * 保持 {@code @Component} 作兜底（不排除）。注入点按 {@code @Primary} 选业务实现；容器无业务实现时
+ * 自然落到默认实现。新增实现方必须遵守本规则，并同步更新本段说明。
+ *
+ * <p>当前默认实现见 {@link LoggingRecomputeRequester}（留痕并真调 {@code recompute}）。
  */
 public interface RecomputeRequester {
 

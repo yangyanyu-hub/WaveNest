@@ -53,6 +53,23 @@ final class FlightPhaseTimeline {
     }
 
     /**
+     * 审计时刻钳制：取理论到期时刻，但不得早于「已发生的下界」——<b>时间不得倒挂</b>。
+     *
+     * <p>为什么需要钳制：迁移时刻是按 {@code meet_time} 倒推的，而订单可能「下单即临期」
+     * （去程时长大于下单到会面的剩余时间），此时倒推的起飞时刻早于下单时刻；位置驱动提前
+     * 切入又用当前时刻写审计、随后时间轴仍按 {@code meet_time} 取值。两种情形都会让
+     * {@code task_log.ts} 与 {@code log_id} 顺序相反，按时间排序的回放与按主键取最新的
+     * 「最后阶段」互相矛盾。
+     *
+     * @param dueMs   理论到期时刻，Unix 毫秒
+     * @param floorMs 已发生的下界（下单时刻或本周期上一条审计时刻）；无下界传 0
+     * @return 严格大于 {@code floorMs} 且不小于 {@code dueMs} 的时刻
+     */
+    static long auditTs(long dueMs, long floorMs) {
+        return dueMs > floorMs ? dueMs : floorMs + 1L;
+    }
+
+    /**
      * 一段飞行迁移。
      *
      * @param from   变更前状态
