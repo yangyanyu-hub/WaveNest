@@ -10,27 +10,48 @@ import com.waterlogistics.contract.order.OrderView;
  * {@code reasonCode}，前端据 {@code reasonCode} 提示原因即可；不因业务拒绝返回 4xx，
  * 避免前端把「业务拒绝」误判为「接口故障」。
  *
- * @param accepted   是否受理通过
- * @param orderId    订单标识（受理通过才有值）
- * @param order      订单展示视图（受理通过才有值），字段见 {@link OrderView}
- * @param reasonCode 拒绝原因码（受理通过时为 null），取值见
- *                   {@link OrderAdmissionService.RejectReason}
- * @param message    拒绝原因说明（供前端直接展示）
+ * <p><b>三种出口</b>（阶段一 26 接线后）：
+ * <ul>
+ *   <li>受理并调度——{@code accepted=true}，{@code waitReason=null}；</li>
+ *   <li>延后待唤醒——{@code accepted=true}，{@code waitReason} 非 null
+ *       （{@code WAIT_SHIP}／{@code WAIT_CARGO}／{@code GATE_OR_DATA}），
+ *       订单进「已受理待唤醒」，由唤醒链路在 {@code wakeEtaTs} 前后重推调度；</li>
+ *   <li>拒绝／转人工——{@code accepted=false} ＋ {@code reasonCode}。</li>
+ * </ul>
+ *
+ * @param accepted   是否受理（延后也算受理，只是不立即进调度）
+ * @param orderId    订单标识（受理或延后都有值）
+ * @param order      订单展示视图（受理或延后都有值），字段见 {@link OrderView}
+ * @param reasonCode 原因码：拒绝时为拒绝原因；延后时为判定链原因（如 {@code SHIP_OUT_OF_SEGMENT}）；
+ *                   受理并调度时为 null
+ * @param message    原因说明（供前端直接展示）
+ * @param waitReason 延后等待原因（仅延后非 null），取值见
+ *                   {@link com.waterlogistics.contract.rest.WaitReason}
+ * @param wakeEtaTs  预计唤醒时刻，Unix 毫秒（仅延后且可估计时非 null）
  */
 public record OrderSubmitResponse(
         boolean accepted,
         String orderId,
         OrderView order,
         String reasonCode,
-        String message) {
+        String message,
+        String waitReason,
+        Long wakeEtaTs) {
 
-    /** 受理通过。 */
+    /** 受理并调度。 */
     public static OrderSubmitResponse accepted(OrderView order) {
-        return new OrderSubmitResponse(true, order.orderId(), order, null, null);
+        return new OrderSubmitResponse(true, order.orderId(), order, null, null, null, null);
     }
 
-    /** 受理拒绝。 */
+    /** 延后待唤醒：受理通过但不进调度，等待唤醒。 */
+    public static OrderSubmitResponse deferred(OrderView order, String reasonCode, String message,
+            String waitReason, Long wakeEtaTs) {
+        return new OrderSubmitResponse(true, order.orderId(), order, reasonCode, message,
+                waitReason, wakeEtaTs);
+    }
+
+    /** 受理拒绝（含转人工：转人工用 {@code reasonCode=INCOMPLETE} 表达）。 */
     public static OrderSubmitResponse rejected(String reasonCode, String message) {
-        return new OrderSubmitResponse(false, null, null, reasonCode, message);
+        return new OrderSubmitResponse(false, null, null, reasonCode, message, null, null);
     }
 }

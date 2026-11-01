@@ -153,8 +153,10 @@ class SmokeM6M2Test {
         assertThat(flightLogs).extracting(TaskLogEntity::getOpType)
                 .containsExactly("起飞确认", "进入末段交接", "交接完成", "落巢完成");
         assertThat(logs).hasSize(4);
+        // a41d6fb（-23）起 emit 同事务写 order_task.status：飞行阶段推进即主状态流转，
+        // 一次完整飞行后主状态为「已完成」（旧行为「仍停在已派发」已废弃）
         assertThat(orderTaskMapper.selectById(orderId).getStatus())
-                .isEqualTo(OrderStatus.DISPATCHED.getValue());
+                .isEqualTo(OrderStatus.FINISHED.getValue());
         assertThat(applicationEvents.stream(OrderStateChangedEvent.class)
                 .filter(event -> event.view().orderId().equals(orderId))
                 .map(event -> event.view().orderStatus()))
@@ -172,6 +174,12 @@ class SmokeM6M2Test {
         assertThat(snapshot.stateVersion()).isEqualTo(flightLogs.get(3).getLogId() + 1L);
 
         // 重派复用同一 orderId：上一周期的飞行日志不得让新周期直接判完成。
+        // a41d6fb（-23）起主状态随飞行阶段走到「已完成」，requeue 白名单不含已完成
+        // （物理约束：完成单不可直接重入队）——先模拟落巢回收把主状态置回「已派发」，
+        // 再走 requeue → startDispatch → dispatch 的重派序列
+        OrderTaskEntity forRedispatch = orderTaskMapper.selectById(orderId);
+        forRedispatch.setStatus(OrderStatus.DISPATCHED.getValue());
+        orderTaskMapper.updateById(forRedispatch);
         String droneId = after.getDroneId();
         BigDecimal meetLon = after.getMeetLon();
         BigDecimal meetLat = after.getMeetLat();
@@ -200,8 +208,9 @@ class SmokeM6M2Test {
                 .filter(view -> view.orderId().equals(orderId))
                 .findFirst().orElseThrow();
         assertThat(redispatched.orderStatus()).isEqualTo(OrderStatus.FINISHED);
+        // 重派第二周期同样以 emit 写主状态：二次飞行完成后仍为「已完成」
         assertThat(orderTaskMapper.selectById(orderId).getStatus())
-                .isEqualTo(OrderStatus.DISPATCHED.getValue());
+                .isEqualTo(OrderStatus.FINISHED.getValue());
     }
 
     /** 判据：闸门口径（22 §3.2）——正常放行 / 熔断回显契约 record */
@@ -236,7 +245,7 @@ class SmokeM6M2Test {
             OrderSubmitResponse resp = admissionService.submit(new OrderSubmitRequest(
                     "223456789", 3.0, "食品",
                     System.currentTimeMillis() + 3_600_000L, "NORMAL"));
-            assertThat(resp.accepted()).isTrue();
+        assertThat(resp.accepted()).isTrue();
             String orderId = resp.orderId();
 
             OrderTaskEntity deferred = orderTaskMapper.selectById(orderId);

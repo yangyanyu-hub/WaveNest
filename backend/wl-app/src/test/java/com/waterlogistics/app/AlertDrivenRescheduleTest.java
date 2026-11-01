@@ -89,13 +89,23 @@ class AlertDrivenRescheduleTest {
         }
     }
 
+    /**
+     * 重复单判重键＝同船＋同货类＋重量差 ≤0.5 kg（80 §3.1.3）：每笔新单轮换白名单货类错开。
+     * 不用重量错开——机队 M30T 载重上界 6 kg、M400 只驻 NEST-01（NEST-02 不允许 M400），
+     * 重量一超 6 kg 同用例第二笔单就无候选可派。
+     */
+    private static final String[] CARGOS = {"医疗物资", "应急药品", "食品", "生活物资"};
+
+    private final java.util.concurrent.atomic.AtomicLong orderSeq = new java.util.concurrent.atomic.AtomicLong();
+
     /** 前置：喂船位快照（候选距离过滤与会面求解前提），下单走完整主链到「已派发」 */
     private String dispatchedOrder() {
         // 船位取南昌赣江演示航段南昌大桥旁（T1-5 起机巢在航段两端，两巢均在 5km 内）
         predictionService.refresh(new AisMessage(
                 SHIP, "F1测试船", 115.8590, 28.6630, 5.0, 90.0, System.currentTimeMillis()));
         OrderSubmitResponse resp = admissionService.submit(new OrderSubmitRequest(
-                SHIP, 5.5, "医疗物资", System.currentTimeMillis() + 3_600_000L, "URGENT"));
+                SHIP, 5.5, CARGOS[(int) (orderSeq.getAndIncrement() % CARGOS.length)],
+                System.currentTimeMillis() + 3_600_000L, "URGENT"));
         assertThat(resp.accepted()).isTrue();
         OrderTaskEntity order = orderTaskMapper.selectById(resp.orderId());
         assertThat(order.getStatus()).isEqualTo(OrderStatus.DISPATCHED.getValue());

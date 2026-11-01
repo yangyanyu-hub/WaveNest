@@ -108,6 +108,17 @@ public class PredictionService {
      */
     private final Map<String, AtomicLong> versionCounters = new ConcurrentHashMap<>();
 
+    /**
+     * 每船计算锁（HIGH.23）：串行化「取版本 → 建快照 → 登记 → 发布」。
+     *
+     * <p><b>为什么按船串行</b>：版本号取自 {@link AtomicLong}，但「取版本」与「登记快照」
+     * 是两步——无同步时两条线程可能交错成「A 取 v1 → B 取 v2 → B 先 put → A 后 put」，
+     * <b>低版本覆盖高版本</b>，下游按版本判新旧的口径就会永远停在旧版。
+     * refresh 由入端按船 1 Hz 调用、recompute 是偶发，同一船的锁竞争可忽略；
+     * 建快照放在锁内换的是「同船两帧绝不乱序」，吞吐量不受影响（不同船并行如常）。
+     */
+    private final Map<String, Object> computeLocks = new ConcurrentHashMap<>();
+
     /** 精算输出被断言网拒绝、回落匀速版的累计次数。 */
     private final AtomicLong preciseRejections = new AtomicLong();
 
@@ -192,23 +203,27 @@ public class PredictionService {
      *                             只有入端 {@link #refresh} 为 {@code true}
      */
     private PredictionSnapshot computeSnapshot(AisMessage message, boolean signalOnPremiseChange) {
-        long version = nextVersion(message.mmsi());
-        PredictionSnapshot snapshot = buildSnapshot(message, version);
+        Object lock = computeLocks.computeIfAbsent(message.mmsi(), key -> new Object());
+        synchronized (lock) {
+            long version = nextVersion(message.mmsi());
+            PredictionSnapshot snapshot = buildSnapshot(message, version);
 
-        PredictionSnapshot previous = latestSnapshots.put(message.mmsi(), snapshot);
-        lastObservations.put(message.mmsi(), message);
-        Double previousCog = lastObservedCog.put(message.mmsi(), message.cog());
+            PredictionSnapshot previous = latestSnapshots.put(message.mmsi(), snapshot);
+            lastObservations.put(message.mmsi(), message);
+            Double previousCog = lastObservedCog.put(message.mmsi(), message.cog());
 
-        log.debug("预测刷新：mmsi={} version={} points={} 有效期={}s 前提={} 模式={}",
-                snapshot.mmsi(), snapshot.version(), snapshot.points().size(),
-                snapshot.validitySec(), snapshot.premise(), profile.mode().code());
+            log.debug("预测刷新：mmsi={} version={} points={} 有效期={}s 前提={} 模式={} 被替换版本={}",
+                    snapshot.mmsi(), snapshot.version(), snapshot.points().size(),
+                    snapshot.validitySec(), snapshot.premise(), profile.mode().code(),
+                    previous == null ? "无" : previous.version());
 
-        // 先广播本版，再判前提：重算若被触发会产出更高版本，顺序反了会让下游先收到旧版
-        eventPublisher.publishEvent(new PredictionUpdatedEvent(snapshot.toFrame()));
-        if (signalOnPremiseChange) {
-            maybeRequestRecompute(previousCog, message, snapshot);
+            // 先广播本版，再判前提：重算若被触发会产出更高版本，顺序反了会让下游先收到旧版
+            eventPublisher.publishEvent(new PredictionUpdatedEvent(snapshot.toFrame()));
+            if (signalOnPremiseChange) {
+                maybeRequestRecompute(previousCog, message, snapshot);
+            }
+            return snapshot;
         }
-        return snapshot;
     }
 
     /**
