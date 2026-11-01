@@ -32,15 +32,15 @@ import org.springframework.stereotype.Component;
  *   <tr><td>taskId</td><td>{@code order_task} 无独立任务号列，以订单号兼任</td><td>订单必在</td></tr>
  *   <tr><td>orderId／droneId</td><td>告警消息 ＋ 订单表</td><td>缺订单号即跳过</td></tr>
  *   <tr><td>homeNestId</td><td>{@code drone.home_nest_id}（订单表无此列）</td><td>缺 → 跳过</td></tr>
- *   <tr><td>position</td><td><b>订单会面点</b> {@code meet_lon/meet_lat}——在途机的最近已知目标位置，
- *       M2 侧唯一可得坐标（遥测归 M4，不跨模块取）</td><td>缺（未派发）→ 跳过</td></tr>
+ *   <tr><td>position</td><td><b>告警自带 {@code lon/lat}</b>（T1-3 填入的告警目标位置，失联为最后已知位置）；
+ *       缺失或非法时才回落订单会面点 {@code meet_lon/meet_lat}</td><td>两者皆缺 → 跳过</td></tr>
  *   <tr><td>batteryPercent</td><td>低电量取告警 {@code currentValue}（检测层电量%）；
  *       失联消息无当前值，退 {@code drone.battery} 最近电量</td><td>两者皆缺 → 跳过</td></tr>
  *   <tr><td>homewardEnergyBaselinePercent</td><td><b>B 组返程精算未接</b>——演示期取
  *       {@code e10ReserveRatio}×100 同值，A1 判据退化为「电量 ≥ 2×储备」；
  *       B 组接链后改为精算值注入（此处注释即接链点）</td><td>必有（键有默认）</td></tr>
  *   <tr><td>cargoOnboard</td><td>订单表 {@code drone_id} 与告警机号一致（货随原机）</td><td>推导得出</td></tr>
- *   <tr><td>windSnapshot</td><td>M2 气象快照最新一条（{@code WeatherSnapshotStore.newest()}）</td>
+ *   <tr><td>windSnapshot</td><td>M2 气象快照中距该位置<b>最近且新鲜</b>的一条（{@code WeatherSnapshotStore.nearest}）</td>
  *       <td>无 → null（§7.3「无风况快照按固定裕度系数 k 判」）</td></tr>
  *   <tr><td>abortReason</td><td>告警类型中文值</td><td>—</td></tr>
  *   <tr><td>commCovered</td><td>失联 {@code false}、其余 {@code true}</td>
@@ -76,8 +76,9 @@ public class HomecomingInputAssembler {
                     message.droneId(), message.eventId());
             return null;
         }
-        if (order.getMeetLon() == null || order.getMeetLat() == null) {
-            log.warn("返航复核跳过：订单 {} 无会面点坐标（未派发无从知机位），不臆造位置 eventId={}",
+        Optional<GeoPoint> alertPoint = alertPositionOf(message);
+        if (alertPoint.isEmpty() && (order.getMeetLon() == null || order.getMeetLat() == null)) {
+            log.warn("返航复核跳过：告警无位置且订单 {} 无会面点坐标（未派发无从知机位），不臆造位置 eventId={}",
                     order.getOrderId(), message.eventId());
             return null;
         }
@@ -87,8 +88,8 @@ public class HomecomingInputAssembler {
                     message.currentValue(), drone.getBattery(), message.eventId());
             return null;
         }
-        GeoPoint position = new GeoPoint(
-                order.getMeetLon().doubleValue(), order.getMeetLat().doubleValue());
+        GeoPoint position = alertPoint.orElseGet(
+                () -> new GeoPoint(order.getMeetLon().doubleValue(), order.getMeetLat().doubleValue()));
         boolean lostLink = AlertType.LOST_LINK.getValue().equals(message.alertType());
         return new HomecomingInput(
                 message.eventId(),
@@ -102,7 +103,7 @@ public class HomecomingInputAssembler {
                 homewardEnergyBaselinePct(),
                 order.getDroneId() != null && order.getDroneId().equals(message.droneId()),
                 null,
-                windSnapshot(),
+                windSnapshot(position.lon(), position.lat()),
                 message.alertType(),
                 message.timestamp(),
                 lostLink ? Boolean.FALSE : Boolean.TRUE);
@@ -145,10 +146,24 @@ public class HomecomingInputAssembler {
         return sysParamLoader.getDouble("e10ReserveRatio", 0.20) * 100;
     }
 
-    /** 最新风况快照；无观测时 null（§7.3 允许缺省，判定侧退 k 系数档）。 */
-    private WindSnapshot windSnapshot() {
-        Optional<com.waterlogistics.contract.mq.WeatherData> newest = weatherStore.newest();
-        return newest
+    /** 告警自带位置；缺失或非有限／越界时为空，由调用方回落订单会面点。 */
+    private static Optional<GeoPoint> alertPositionOf(AlertEventMessage message) {
+        Double lon = message.lon();
+        Double lat = message.lat();
+        if (lon == null || lat == null
+                || !Double.isFinite(lon) || !Double.isFinite(lat)
+                || lon < -180.0 || lon > 180.0
+                || lat < -90.0 || lat > 90.0) {
+            return Optional.empty();
+        }
+        return Optional.of(new GeoPoint(lon, lat));
+    }
+
+    /** 机位附近新鲜风况；无新鲜数据时 null（§7.3 允许缺省，判定侧退 k 系数档）。 */
+    private WindSnapshot windSnapshot(double lon, double lat) {
+        Optional<com.waterlogistics.contract.mq.WeatherData> nearest =
+                weatherStore.nearest(lon, lat, System.currentTimeMillis());
+        return nearest
                 .map(w -> new WindSnapshot(w.windSpeedMs(), w.windDirDeg(), w.obsTs()))
                 .orElse(null);
     }
