@@ -66,12 +66,20 @@ public class FeasibilityJudge {
      * @param worstWindMs  现场最不利风速（m/s；首版实测代偿，取自 data.weather 按位置取最不利）
      * @param payloadKg    订单载荷（kg，载荷附加耗电用）
      * @param params       判定参数
+     * @throws IllegalArgumentException {@code distKm}／{@code worstWindMs}／{@code payloadKg} 非有限或为负
+     *         （评审 HIGH.8：NaN 参与 {@code >}／{@code <} 比较恒为 false，
+     *         会让风况闸与电量闸同时失效、全部候选静默判 FEASIBLE）
      */
     public FeasibilityResult judge(CandidateGenerator.CandidateCombo combo,
                                    double distKm,
                                    double worstWindMs,
                                    double payloadKg,
                                    Params params) {
+        // 0) 入口非有限值守卫——判定层的最后一道防线，不依赖调用方自觉（评审 HIGH.8）
+        requireFiniteNonNegative("distKm", distKm);
+        requireFiniteNonNegative("worstWindMs", worstWindMs);
+        requireFiniteNonNegative("payloadKg", payloadKg);
+
         List<String> reasons = new ArrayList<>();
 
         // 1) 风况闸：机型抗风等级 ≥ 任务区最不利风级（62 判据 windclass_match）
@@ -87,9 +95,12 @@ public class FeasibilityJudge {
                         worstWindMs, combo.type(), windLimit));
             }
         } else if (worstWindMs > params.maxWindMs()) {
-            // 未登记时不能默默放行，也不能按 0 拦死——按统一上限判，并在原因里写明是回落口径
+            // 未登记时不能默默放行，也不能按 0 拦死——按统一上限判，并在原因里写明是回落口径。
+            // 该上限由调用方给「保守值」（已登记机型最小值与预警阈值的较小者），
+            // 不再是气象熔断阈值 12.0（评审 MEDIUM.16：原口径下"未登记"反而最宽松）
             reasons.add(String.format(
-                    "风况超限：最不利风 %.1f m/s > 上限 %.1f m/s（机型抗风未登记 drone.wind_limit_ms，取统一上限）",
+                    "风况超限：最不利风 %.1f m/s > 上限 %.1f m/s"
+                            + "（机型抗风未登记 drone.wind_limit_ms，按保守口径判、未按最宽松值放行）",
                     worstWindMs, params.maxWindMs()));
         }
 
@@ -108,5 +119,13 @@ public class FeasibilityJudge {
         return new FeasibilityResult(combo.comboId(),
                 reasons.isEmpty() ? Verdict.FEASIBLE : Verdict.INFEASIBLE,
                 reasons);
+    }
+
+    /** 非有限值（NaN／±Infinity）与负值一律拒绝——见 {@link #judge} 的入口守卫说明。 */
+    private static void requireFiniteNonNegative(String name, double value) {
+        if (!Double.isFinite(value) || value < 0.0) {
+            throw new IllegalArgumentException(
+                    name + " 必须是有限非负数，实际 " + value);
+        }
     }
 }

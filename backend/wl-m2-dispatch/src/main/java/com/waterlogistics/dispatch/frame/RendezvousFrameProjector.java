@@ -109,8 +109,11 @@ public final class RendezvousFrameProjector {
      * 落选者 {@code selected=false} 且带原因，前端据此置灰。<b>与 {@link #reasonsOf} 不是替代关系</b>——
      * {@code reasonsOf} 只有落选项的文案串（前端第一步已在消费），本方法给的是全量结构化列表。
      *
-     * <p><b>{@code distKm} 的 NaN 处理</b>：上游组合缺失时判定端写的是 {@code Double.NaN}，
+     * <p><b>非有限值处理（评审 MEDIUM.19）</b>：上游组合缺失时判定端写的是 {@code Double.NaN}，
      * 而 NaN 不是合法 JSON、会让前端整帧解析失败，故此处转成 {@code null} 出库。
+     * <b>{@code ±Infinity} 同理</b>——{@code JSON.stringify(Infinity)} 得到 {@code null}
+     * 或直接抛错，Jackson 结构化序列化也会炸，故统一用 {@link Double#isFinite} 一并拦下；
+     * 只判 {@code isNaN} 会让无穷大漏进帧里。
      *
      * @param selection      候选判定结果；传 {@code null} 返回空列表（不发帧的调用点不 NPE）
      * @param chosenComboId  中选组合标识；传 {@code null} 则无人被标中选
@@ -129,7 +132,7 @@ public final class RendezvousFrameProjector {
                     verdict.model(),
                     verdict.nestId(),
                     verdict.droneId(),
-                    Double.isNaN(distKm) ? null : distKm,
+                    Double.isFinite(distKm) ? distKm : null,
                     verdict.feasible(),
                     verdict.reasons(),
                     chosenComboId != null && chosenComboId.equals(verdict.comboId())));

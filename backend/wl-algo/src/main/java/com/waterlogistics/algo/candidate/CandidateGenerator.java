@@ -84,7 +84,12 @@ public class CandidateGenerator {
                 continue;
             }
             // 4) 机巢允许该机型
-            if (nest.allowedTypes() != null && !nest.allowedTypes().contains(d.type())) {
+            //    空列表 = 未登记 = 不限制机型（评审 MEDIUM.18）。
+            //    原判断只看 null，而调用方在「字段为空白」时给的是空列表——
+            //    于是「未登记」被当成「任何机型都不允许」，该巢的候选被静默清零。
+            //    两种写法（null / 空列表）必须同义，否则同一份台账换个写法结果就变了。
+            if (nest.allowedTypes() != null && !nest.allowedTypes().isEmpty()
+                    && !nest.allowedTypes().contains(d.type())) {
                 continue;
             }
             // 5) 距离过滤（等距直线粗估）

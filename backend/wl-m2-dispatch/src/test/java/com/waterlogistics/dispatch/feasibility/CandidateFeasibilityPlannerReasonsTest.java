@@ -66,6 +66,9 @@ class CandidateFeasibilityPlannerReasonsTest {
         d.setDroneId(id);
         d.setModel(model);
         d.setStatus("空闲");
+        // 11-01 评审 HIGH.6：候选查询加了健康状态白名单，桩必须给「健康」，
+        // 否则这些用例会因「查不到无人机」全挂在「无可飞候选」上（那不是被测逻辑的问题）
+        d.setHealthStatus("健康");
         d.setCurrentNestId("NEST-01");
         d.setBattery(BigDecimal.valueOf(90));
         d.setMaxPayload(BigDecimal.valueOf(9));
