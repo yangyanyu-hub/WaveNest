@@ -359,6 +359,8 @@ public class CandidateFeasibilityPlanner {
                     drone.getCurrentNestId() != null ? drone.getCurrentNestId() : drone.getHomeNestId(),
                     drone.getModel(),
                     drone.getStatus(),
+                    // battery/maxPayload 缺失按 0.0＝有意保守（缺数据当"没电/载不动"，被闸淘汰），
+                    // 不学 windLimit 的 NaN 口径——NaN 参与比较恒 false 会放过没电的机（与 CandidateSelector 同注）
                     drone.getBattery() != null ? drone.getBattery().doubleValue() : 0.0,
                     drone.getMaxPayload() != null ? drone.getMaxPayload().doubleValue() : 0.0,
                     optionalDouble(drone.getWindLimitMs()),

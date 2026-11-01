@@ -105,6 +105,11 @@ public class FeasibilityJudge {
         }
 
         // 2) 电量闸（往返粗估：去程 dist + 回程 dist，简化按同距离）
+        //    已知欠账（Open CodeReview 指出）：真实的往返是「巢→取货点→交货点→巢」三段，
+        //    这里只算了「取货↔交货」两段，巢→取货一段未计入，电量闸系统性偏乐观。
+        //    调用方（CandidateService）传的是主航段单程距离，无巢→取货数据可用；
+        //    待 51 清单 #19（航迹生成接入派发）后改为按真实任务航迹累计里程，
+        //    在那之前此闸只当粗筛用，不作为电量安全的最终依据。
         double roundTripKm = 2.0 * distKm;
         double consume = roundTripKm * params.batteryPerKmPercent()
                 + payloadKg * params.batteryPerKgPercent();

@@ -111,6 +111,10 @@ public class CandidateSelector {
                 d.getCurrentNestId() != null ? d.getCurrentNestId() : d.getHomeNestId(),
                 d.getModel(),
                 d.getStatus(),
+                // battery/maxPayload 缺失按 0.0 处理是有意的保守策略（Open CodeReview 质疑后立此存照）：
+                // 缺数据 ⇒ 当作"没电/载不动" ⇒ 被闸自然淘汰，方向安全。
+                // 切不可学 windLimit 的 NaN 口径——NaN 参与 > / < 比较恒 false，
+                // 会让没电的机器通过电量闸（那才是危险方向）。缺失数据在台账里补。
                 d.getBattery() != null ? d.getBattery().doubleValue() : 0.0,
                 d.getMaxPayload() != null ? d.getMaxPayload().doubleValue() : 0.0,
                 // 机型能力两列（10-20 B1）：DB 缺失时给 NaN 表示"未登记"，
