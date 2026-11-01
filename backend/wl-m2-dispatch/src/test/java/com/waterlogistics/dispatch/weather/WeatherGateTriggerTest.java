@@ -61,14 +61,31 @@ class WeatherGateTriggerTest {
     }
 
     @Test
-    @DisplayName("未超阈值不熔断；恰好等于阈值也不熔断（判据是「超过」）")
+    @DisplayName("达到阈值即熔断（>= 边界，MEDIUM.67）；低于阈值不熔断")
     void notExceeding_shouldStayOpen() {
         feed(CRITICAL - 0.1, T0);
         assertTrue(gate.isOpen());
 
         feed(CRITICAL, T0 + 1_000L);
-        assertTrue(gate.isOpen(), "等于阈值不算超过");
-        assertFalse(trigger.isTrippedByWeather());
+        assertFalse(gate.isOpen(), "达到阈值即熔断（MEDIUM.67：边界统一为 >=）");
+        assertTrue(trigger.isTrippedByWeather());
+    }
+
+    @Test
+    @DisplayName("HIGH.36 对账：外部 reset 掉 AUTO 而风仍临界 → 下次评估重新置位")
+    void gateResetExternally_shouldRetripOnNextEvaluate() {
+        feed(CRITICAL + 1.0, T0);
+        assertFalse(gate.isOpen());
+        assertTrue(trigger.isTrippedByWeather());
+
+        // 外部干预（人工复位）把 AUTO 清掉，本地标记仍是 true——两侧脱节
+        gate.reset();
+        assertTrue(gate.isOpen());
+
+        // 风仍然临界：下一次评估必须重新 trip（不得以本地标记为由跳过）
+        feed(CRITICAL + 0.5, T0 + 1_000L);
+        assertFalse(gate.isOpen(), "闸门 AUTO 被外部清除后，风仍临界必须重新熔断");
+        assertEquals(java.util.List.of(GateSource.AUTO), gate.summary().gateSources());
     }
 
     @Test

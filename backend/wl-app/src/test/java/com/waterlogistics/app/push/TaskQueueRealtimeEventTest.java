@@ -3,6 +3,8 @@ package com.waterlogistics.app.push;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.isNull;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -33,6 +35,8 @@ class TaskQueueRealtimeEventTest {
         List<Object> events = new ArrayList<>();
         OrderTaskEntity order = order("ORD-1", OrderStatus.DISPATCHING);
         when(orders.selectById("ORD-1")).thenReturn(order);
+        // HIGH.29 起状态流转走条件更新并校验影响行数，mock 需返回 1
+        when(orders.update(isNull(), any())).thenReturn(1);
         LocalDateTime meetTime = LocalDateTime.of(2026, 10, 21, 20, 0);
 
         TaskQueueService service = new TaskQueueService(orders, logs, gate, events::add);
@@ -61,6 +65,7 @@ class TaskQueueRealtimeEventTest {
         DispatchGateService gate = mock(DispatchGateService.class);
         List<Object> events = new ArrayList<>();
         when(orders.selectById("ORD-2")).thenReturn(order("ORD-2", OrderStatus.DISPATCHING));
+        when(orders.update(isNull(), any())).thenReturn(1);
 
         TaskQueueService service = new TaskQueueService(orders, logs, gate, events::add);
         service.dispatch("ORD-2", "UAV-02", LocalDateTime.of(2026, 10, 21, 20, 0));

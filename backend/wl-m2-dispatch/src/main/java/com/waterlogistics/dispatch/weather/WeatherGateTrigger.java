@@ -77,20 +77,26 @@ public class WeatherGateTrigger {
             return false;
         }
         double wind = worst.getAsDouble();
+        // HIGH.36：本地标记可能与闸门实际来源脱节（人工复位、bean 重建后闸门残留 AUTO），
+        // 每次评估先与 gateService.summary() 对账，以闸门侧为准
+        boolean autoRegistered = gateService.summary().gateSources().contains(GateSource.AUTO);
 
-        if (wind > settings.criticalWindMs()) {
+        // MEDIUM.67：边界统一为「达到即熔断」（>=），与运维口径一致
+        if (wind >= settings.criticalWindMs()) {
             consecutiveBelow = 0;
-            if (!trippedByWeather) {
-                trippedByWeather = true;
+            if (!trippedByWeather || !autoRegistered) {
+                // MEDIUM.68：先调闸门成功后再改本地标记，避免调用抛异常时标记悬空
                 gateService.trip(GateSource.AUTO);
-                log.warn("气象熔断：最不利风速 {} m/s 超过严重阈值 {} m/s，闸门已置 AUTO 熔断",
+                trippedByWeather = true;
+                log.warn("气象熔断：最不利风速 {} m/s 达到严重阈值 {} m/s，闸门已置 AUTO 熔断",
                         wind, settings.criticalWindMs());
                 return true;
             }
             return false;
         }
 
-        if (!trippedByWeather) {
+        // 到达此处必有 wind < critical（达到阈值已在上面分支熔断），计入「低于阈值」样本
+        if (!trippedByWeather && !autoRegistered) {
             consecutiveBelow = 0;
             return false;
         }
@@ -98,9 +104,10 @@ public class WeatherGateTrigger {
         // 纪律 2：连续 N 条回落才解除
         consecutiveBelow++;
         if (consecutiveBelow >= settings.clearDebounceCount()) {
+            // MEDIUM.68：clear 分支同样先调用成功后再改本地标记
+            gateService.clear(GateSource.AUTO);
             trippedByWeather = false;
             consecutiveBelow = 0;
-            gateService.clear(GateSource.AUTO);
             log.info("气象熔断解除：最不利风速 {} m/s 已连续 {} 条低于严重阈值 {} m/s",
                     wind, settings.clearDebounceCount(), settings.criticalWindMs());
             return true;
