@@ -1,12 +1,14 @@
 package com.waterlogistics.dispatch.taskstate;
 
 import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.baomidou.mybatisplus.core.conditions.update.LambdaUpdateWrapper;
 import com.waterlogistics.algo.meeting.GeoApprox;
 import com.waterlogistics.contract.order.OrderView;
 import com.waterlogistics.contract.state.OrderStatus;
 import com.waterlogistics.dispatch.order.OrderStateChangedEvent;
 import com.waterlogistics.rendezvous.port.DroneContext;
 import com.waterlogistics.rendezvous.port.DroneContextPort;
+import com.waterlogistics.storage.entity.DroneEntity;
 import com.waterlogistics.storage.entity.OrderTaskEntity;
 import com.waterlogistics.storage.entity.TaskLogEntity;
 import com.waterlogistics.storage.param.SysParamLoader;
@@ -20,13 +22,15 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.ZoneId;
 import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.OptionalLong;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -35,31 +39,46 @@ import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.event.TransactionPhase;
 import org.springframework.transaction.event.TransactionalEventListener;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * 飞行阶段推进器（F2）——按时间把在飞订单推进
  * {@code 已派发 → 去程中 → 末段交接中 → 返航中 → 已完成}。
  *
- * <p><b>写入口径</b>：飞行态只写 {@code task_log}，事实来源是已派发订单的
- * {@code meet_time}（会面时刻）与机型巡航速度。<b>不写 {@code order_task.status}</b>：
- * 那是订单态，飞行态由本推进器在事件流中表达，避免两套状态互相覆盖。
+ * <p><b>写入口径（阶段一 23 起）</b>：每次阶段迁移在<b>同一事务</b>内完成三件事：
+ * ① 条件更新 {@code order_task.status}（{@code WHERE order_id=? AND status=from}）；
+ * ② 插入 {@code task_log} 审计；③ 条件更新 {@code drone} 状态。
+ * 条件更新影响行数为 0 说明订单态已被他处改动——此时<b>不写审计</b>、记 error、本轮不推进，
+ * 避免出现「日志说有迁移、订单表没变」的假审计。事实来源仍是已派发订单的 {@code meet_time}
+ * 与机型巡航速度。
  *
  * <p><b>时间基准</b>：
  * <ul>
  *   <li>去程时长＝机巢到会面点的大圆距离 ÷ 巡航速度；</li>
  *   <li>起飞时刻＝会面时刻 − 去程时长；</li>
- *   <li>末段交接开始＝会面时刻；</li>
+ *   <li>末段交接开始＝会面时刻（阶段一 17 起，实时位置进入接近半径时可提前切换）；</li>
  *   <li>返航开始＝会面时刻 ＋ {@code sys_param.tHandoverMinSec}；</li>
  *   <li>已完成＝返航开始 ＋ 去程时长（返程按同一机型速度回原巢）。</li>
  * </ul>
  *
- * <p><b>为什么可以按时间推进</b>：演示期遥测是绕圈仿真，按「进入会面点邻域」
- * 这类位置条件不会稳定触发；会面侧已有的交接判定仍是正式口径，接入样本流后
- * 直接复用其结论替换本推进器的对应时刻，不在本类重算交接判定。
+ * <p><b>位置驱动末段（阶段一 17）</b>：{@code OUTBOUND} 阶段若 {@link DronePositionPort} 能给出
+ * 该机实时位置且距会面点 ≤ {@code wavenest.m2.approach-radius-m}，提前切 {@code HANDOVER}；
+ * 位置缺失或超半径则保持原时间轴推进，<b>不得因缺位置卡死</b>。
  *
- * <p><b>广播</b>：每次迁移写一条 {@code task_log}（{@code from_status}、
- * {@code to_status}、{@code op_type} 齐全），并发布 {@link FlightPhaseChangedEvent}，
- * 由组装层转成 {@code order_state}；晚到的拍会按到期顺序补记，保证事件流完整。
+ * <p><b>并发</b>：{@link #tick()} 为 {@code synchronized}，且由单线程调度器驱动，
+ * 阶段判断与写回在同一临界区内（HIGH.35 的「与 tick 同锁」口径），不存在并发覆盖。
+ *
+ * <p><b>审计时刻单调</b>：迁移时刻按 {@code meet_time} 倒推，可能早于下单时刻；位置驱动又用
+ * 当前时刻写入。故每次落库前经 {@link FlightPhaseTimeline#auditTs} 钳制，保证同一订单的
+ * {@code task_log.ts} 严格递增且不早于下单时刻，不存在时间倒挂。
+ *
+ * <p><b>缓存失效</b>：订单态变化只把周期缓存标脏（{@link CycleState#markStale()}），下一次
+ * {@code tick()} 重建，<b>不立即删除</b>——删掉会让 {@link #activeOrderIdOf} 在「派发已提交、
+ * 首拍未到」的窗口内查不到该机在飞订单。
+ *
+ * <p><b>广播</b>：每次迁移写一条 {@code task_log}（{@code from_status}、{@code to_status}、
+ * {@code op_type} 齐全），并发布 {@link FlightPhaseChangedEvent}，由组装层转成 {@code order_state}；
+ * 晚到的拍会按到期顺序补记，保证事件流完整。
  */
 @Component
 public class FlightPhaseAdvancer {
@@ -72,6 +91,15 @@ public class FlightPhaseAdvancer {
     private static final String HANDOVER_SEC_KEY = "tHandoverMinSec";
 
     private static final int DEFAULT_HANDOVER_SEC = 120;
+
+    /** 位置不可用时的默认接近半径（米），可由 {@code wavenest.m2.approach-radius-m} 覆盖 */
+    private static final double DEFAULT_APPROACH_RADIUS_M = 50.0;
+
+    /** resolve 失败后的退避时长（毫秒），避免每拍重复查库（MEDIUM.10）。 */
+    private static final long CONTEXT_RETRY_BACKOFF_MS = 30_000L;
+
+    /** 缺上下文告警去重键容量上限，超限清空（仅用于告警去重，无业务影响）。 */
+    private static final int WARN_KEY_CAPACITY = 10_000;
 
     private static final List<OrderStatus> IN_FLIGHT_STATUSES = List.of(
             OrderStatus.DISPATCHED, OrderStatus.OUTBOUND, OrderStatus.HANDOVER,
@@ -86,10 +114,14 @@ public class FlightPhaseAdvancer {
     private final OrderTaskMapper orderTaskMapper;
     private final TaskLogMapper taskLogMapper;
     private final DroneContextPort droneContextPort;
+    private final DronePositionPort dronePositionPort;
     private final SysParamLoader sysParamLoader;
     private final ApplicationEventPublisher eventPublisher;
     private final DroneMapper droneMapper;
+    private final TransactionTemplate transactionTemplate;
     private final Clock clock;
+
+    /** orderId → 版本兜底计数器（task_log 自增主键不可用时用）。 */
     private final Map<String, AtomicLong> fallbackVersions = new ConcurrentHashMap<>();
 
     /** 当前派发周期的阶段缓存：meet_time 或 droneId 变化即作废，避免每拍重复查库。 */
@@ -97,6 +129,13 @@ public class FlightPhaseAdvancer {
 
     /** 缺执行机上下文的告警去重键：orderId@meetMs，每周期只告警一次。 */
     private final Set<String> warnedMissingContext = ConcurrentHashMap.newKeySet();
+
+    /** resolve 失败退避：orderId → 允许重试的时刻（毫秒），避免每拍两次查库（MEDIUM.10）。 */
+    private final Map<String, Long> contextRetryAfterMs = new ConcurrentHashMap<>();
+
+    /** 位置驱动末段的接近半径（米），走配置，不硬编（阶段一 17）。 */
+    @Value("${wavenest.m2.approach-radius-m:50}")
+    private double approachRadiusM;
 
     private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread thread = new Thread(r, "wavenest-flight-phase-advance");
@@ -114,11 +153,13 @@ public class FlightPhaseAdvancer {
     public FlightPhaseAdvancer(OrderTaskMapper orderTaskMapper,
             TaskLogMapper taskLogMapper,
             DroneContextPort droneContextPort,
+            DronePositionPort dronePositionPort,
             SysParamLoader sysParamLoader,
             ApplicationEventPublisher eventPublisher,
-            DroneMapper droneMapper) {
-        this(orderTaskMapper, taskLogMapper, droneContextPort, sysParamLoader,
-                eventPublisher, droneMapper, Clock.systemDefaultZone());
+            DroneMapper droneMapper,
+            TransactionTemplate transactionTemplate) {
+        this(orderTaskMapper, taskLogMapper, droneContextPort, dronePositionPort, sysParamLoader,
+                eventPublisher, droneMapper, transactionTemplate, Clock.systemDefaultZone());
     }
 
     FlightPhaseAdvancer(OrderTaskMapper orderTaskMapper,
@@ -127,8 +168,8 @@ public class FlightPhaseAdvancer {
             SysParamLoader sysParamLoader,
             ApplicationEventPublisher eventPublisher,
             Clock clock) {
-        this(orderTaskMapper, taskLogMapper, droneContextPort, sysParamLoader,
-                eventPublisher, null, clock);
+        this(orderTaskMapper, taskLogMapper, droneContextPort, null, sysParamLoader,
+                eventPublisher, null, null, clock);
     }
 
     FlightPhaseAdvancer(OrderTaskMapper orderTaskMapper,
@@ -138,24 +179,48 @@ public class FlightPhaseAdvancer {
             ApplicationEventPublisher eventPublisher,
             DroneMapper droneMapper,
             Clock clock) {
+        this(orderTaskMapper, taskLogMapper, droneContextPort, null, sysParamLoader,
+                eventPublisher, droneMapper, null, clock);
+    }
+
+    FlightPhaseAdvancer(OrderTaskMapper orderTaskMapper,
+            TaskLogMapper taskLogMapper,
+            DroneContextPort droneContextPort,
+            DronePositionPort dronePositionPort,
+            SysParamLoader sysParamLoader,
+            ApplicationEventPublisher eventPublisher,
+            DroneMapper droneMapper,
+            TransactionTemplate transactionTemplate,
+            Clock clock) {
         this.orderTaskMapper = orderTaskMapper;
         this.taskLogMapper = taskLogMapper;
         this.droneContextPort = droneContextPort;
+        this.dronePositionPort = dronePositionPort;
         this.sysParamLoader = sysParamLoader;
         this.eventPublisher = eventPublisher;
         this.droneMapper = droneMapper;
+        this.transactionTemplate = transactionTemplate;
         this.clock = clock;
     }
 
     @PostConstruct
     void start() {
+        // LOW.11：非法间隔钳制到 ≥1s，并记录生效值
+        long intervalSec = Math.max(1L, advanceIntervalSec);
+        if (advanceIntervalSec < 1L) {
+            log.warn("flight-advance-interval-sec={} 非法（须≥1），钳制为 1s", advanceIntervalSec);
+        }
+        // 阶段一 17：接近半径兜底，避免配置为 0/负数导致永不切换
+        if (!Double.isFinite(approachRadiusM) || approachRadiusM <= 0) {
+            log.warn("approach-radius-m={} 非法，回落默认 {}m", approachRadiusM, DEFAULT_APPROACH_RADIUS_M);
+            approachRadiusM = DEFAULT_APPROACH_RADIUS_M;
+        }
         if (!advanceEnabled) {
             log.info("飞行阶段推进轮询未启用（wavenest.m2.flight-advance-enabled=false）");
             return;
         }
-        scheduler.scheduleWithFixedDelay(this::tickSafely,
-                advanceIntervalSec, advanceIntervalSec, TimeUnit.SECONDS);
-        log.info("飞行阶段推进轮询已启动：间隔 {}s", advanceIntervalSec);
+        scheduler.scheduleWithFixedDelay(this::tickSafely, intervalSec, intervalSec, TimeUnit.SECONDS);
+        log.info("飞行阶段推进轮询已启动：生效间隔 {}s，接近半径 {}m", intervalSec, approachRadiusM);
     }
 
     @PreDestroy
@@ -164,12 +229,18 @@ public class FlightPhaseAdvancer {
     }
 
     /**
-     * 订单态变化后作废该订单的周期缓存：重派可能复用同一 meet_time 与执行机，
-     * 不能只靠时间键识别新周期；派发事务提交后再清，避免清到未提交的旧行。
+     * 订单态变化后把该订单的周期缓存<b>标脏</b>（不删除）：重派可能复用同一 {@code meet_time}
+     * 与执行机，不能只靠时间键识别新周期，故必须让下一拍重建；但直接删掉会让
+     * {@link #activeOrderIdOf} 在「派发已提交、首拍未到」的窗口内返回空，
+     * 前端实时出口的 {@code activeOrderId} 随之丢值。
+     *
+     * <p>派发事务提交后再标，避免标到未提交的旧行。
      */
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
     public void onOrderStateChanged(OrderStateChangedEvent event) {
-        cycleStates.remove(event.view().orderId());
+        String orderId = event.view().orderId();
+        cycleStates.computeIfPresent(orderId, (key, state) -> state.markStale());
+        contextRetryAfterMs.remove(orderId);
     }
 
     /**
@@ -205,48 +276,103 @@ public class FlightPhaseAdvancer {
     }
 
     private void advanceOrder(OrderTaskEntity order) {
+        long nowMs = clock.millis();
         long meetMs = toEpochMs(order.getMeetTime());
-        CycleState state = cycleStates.get(order.getOrderId());
-        if (state == null || state.meetMs() != meetMs
+        String orderId = order.getOrderId();
+        CycleState state = cycleStates.get(orderId);
+        if (state == null || state.stale() || state.meetMs() != meetMs
                 || !state.droneId().equals(order.getDroneId())) {
-            OrderStatus phase = lastFlightPhase(order.getOrderId());
-            if (phase == null) {
-                phase = OrderStatus.DISPATCHED;
-            }
-            DroneContext drone = droneContextPort.resolve(order.getDroneId());
-            if (drone == null) {
-                String warnKey = order.getOrderId() + "@" + meetMs;
-                if (warnedMissingContext.add(warnKey)) {
-                    log.warn("飞行阶段推进缺执行机上下文，跳过：orderId={} droneId={}",
-                            order.getOrderId(), order.getDroneId());
-                }
+            // MEDIUM.10：resolve 失败后进入退避窗口，避免每拍重复查库
+            Long retryAt = contextRetryAfterMs.get(orderId);
+            if (retryAt != null && nowMs < retryAt) {
                 return;
             }
-            warnedMissingContext.remove(order.getOrderId() + "@" + meetMs);
-            state = new CycleState(meetMs, order.getDroneId(), phase, drone);
-            cycleStates.put(order.getOrderId(), state);
+            CyclePhase cycle = lastCyclePhase(orderId);
+            OrderStatus phase = cycle == null ? OrderStatus.DISPATCHED : cycle.phase();
+            DroneContext drone = droneContextPort.resolve(order.getDroneId());
+            if (drone == null) {
+                if (contextRetryAfterMs.size() >= WARN_KEY_CAPACITY) {
+                // 只影响退避时长，清空至多多查一次库；不设上限则长期缺上下文的订单会一直堆积
+                contextRetryAfterMs.clear();
+            }
+            contextRetryAfterMs.put(orderId, nowMs + CONTEXT_RETRY_BACKOFF_MS);
+                warnMissingContext(orderId, meetMs, order.getDroneId());
+                return;
+            }
+            contextRetryAfterMs.remove(orderId);
+            warnedMissingContext.remove(warnKey(orderId, meetMs));
+            state = CycleState.fresh(meetMs, order.getDroneId(), phase, drone,
+                    auditFloorMs(order, cycle));
+            cycleStates.put(orderId, state);
         }
         if (state.phase() == OrderStatus.FINISHED) {
+            // HIGH.3：已完成订单不再保留周期缓存，避免三张 Map 无限增长
+            evictOrder(orderId);
             return;
         }
 
         DroneContext drone = state.drone();
+        double meetLon = order.getMeetLon().doubleValue();
+        double meetLat = order.getMeetLat().doubleValue();
         double outboundM = GeoApprox.distanceM(
-                drone.nestLon(), drone.nestLat(),
-                order.getMeetLon().doubleValue(), order.getMeetLat().doubleValue());
+                drone.nestLon(), drone.nestLat(), meetLon, meetLat);
         int handoverSec = Math.max(0, sysParamLoader.getInt(HANDOVER_SEC_KEY, DEFAULT_HANDOVER_SEC));
         List<FlightPhaseTimeline.Transition> schedule = FlightPhaseTimeline.schedule(
                 meetMs, outboundM, drone.cruiseSpeedMs(), handoverSec);
 
-        long nowMs = clock.millis();
+        // 阶段一 17：实时位置进入接近半径则提前切末段；位置不可用/超半径保持时间轴
+        if (state.phase() == OrderStatus.OUTBOUND) {
+            OptionalLong handoverTs = handoverTsByPosition(
+                    order, meetLon, meetLat, nowMs, state.floorMs());
+            if (handoverTs.isPresent()) {
+                long tsMs = handoverTs.getAsLong();
+                if (!emit(order, OrderStatus.OUTBOUND, OrderStatus.HANDOVER, "末段切入（位置）", tsMs)) {
+                    return;
+                }
+                state = state.advanceTo(OrderStatus.HANDOVER, tsMs);
+                cycleStates.put(orderId, state);
+            }
+        }
+
         for (FlightPhaseTimeline.Transition transition : schedule) {
             if (rank(state.phase()) >= rank(transition.to()) || nowMs < transition.dueMs()) {
                 continue;
             }
-            emit(order, transition.from(), transition.to(), transition.opType(), transition.dueMs());
-            state = new CycleState(meetMs, state.droneId(), transition.to(), drone);
-            cycleStates.put(order.getOrderId(), state);
+            long tsMs = FlightPhaseTimeline.auditTs(transition.dueMs(), state.floorMs());
+            if (!emit(order, transition.from(), transition.to(), transition.opType(), tsMs)) {
+                // 订单态与预期不一致：本轮不推进，等下一拍重新判定
+                return;
+            }
+            state = state.advanceTo(transition.to(), tsMs);
+            cycleStates.put(orderId, state);
         }
+        if (state.phase() == OrderStatus.FINISHED) {
+            // 当拍即清：下一拍订单已不在飞、扫不到，留到那时就永远清不掉
+            evictOrder(orderId);
+        }
+    }
+
+    /**
+     * 阶段一 17：{@code OUTBOUND} 阶段按无人机实时位置判定是否进入末段。
+     *
+     * <p>位置缺失（遥测未就绪）或距离大于接近半径时返回空，由调用方继续时间轴推进。
+     *
+     * @return 末段切入的审计时刻；不该切或切不了时为空
+     */
+    private OptionalLong handoverTsByPosition(OrderTaskEntity order,
+            double meetLon, double meetLat, long nowMs, long floorMs) {
+        if (dronePositionPort == null) {
+            return OptionalLong.empty();
+        }
+        Optional<DronePositionPort.Position> position = dronePositionPort.latest(order.getDroneId());
+        if (position.isEmpty()) {
+            return OptionalLong.empty();
+        }
+        DronePositionPort.Position pos = position.get();
+        if (GeoApprox.distanceM(pos.lon(), pos.lat(), meetLon, meetLat) > approachRadiusM) {
+            return OptionalLong.empty();
+        }
+        return OptionalLong.of(FlightPhaseTimeline.auditTs(nowMs, floorMs));
     }
 
     /**
@@ -256,9 +382,8 @@ public class FlightPhaseAdvancer {
      * {@code meet_time} 最新的一条——重入队后 {@code create_time} 不变，只有
      * {@code meet_time} 才标识本派发周期。
      *
-     * <p><b>为什么不查库</b>：飞行态只写 {@code task_log}，不写 {@code order_task.status}，
-     * 库里订单派发后长期停在「已派发」，按状态查会把已飞完的单重新捞出来；
-     * {@code cycleStates} 的 {@code phase} 是由 {@code task_log} 恢复的真实阶段，判得准。
+     * <p><b>为什么不查库</b>：{@link #cycleStates} 的 {@code phase} 是由 {@code task_log}
+     * 恢复的真实阶段，判得准；库里的订单态可能因派发时序短暂滞后。
      *
      * <p><b>两条边界</b>：① 缓存由 {@code tick()} 按
      * {@code wavenest.m2.flight-advance-interval-sec}（默认 2 秒）刷新，派单后到首次 tick
@@ -287,119 +412,197 @@ public class FlightPhaseAdvancer {
     }
 
     /**
+     * 当前缓存的在飞订单数（运维观察口径）。
+     *
+     * <p>订单推进到「已完成」或建成即完成时会即时淘汰，本值不应随时间单调增长；
+     * 若持续增长说明淘汰链失效（HIGH.3）。
+     */
+    int trackedCycleCount() {
+        return cycleStates.size();
+    }
+
+    /**
      * 按状态链顺序校验并写入一条飞行态审计，随后广播展示视图。
      *
-     * <p><b>无人机状态同步（10-29 新增）</b>：每次阶段迁移时，同步推进
-     * drone 表的 status / position_type / current_nest_id 三字段（23 §7 状态机）：
+     * <p><b>阶段一 23</b>：{@code task_log}、{@code order_task.status}、{@code drone} 状态
+     * 在同一事务内写入；订单条件更新影响 0 行时记 error 并<b>不写审计</b>、返回 {@code false}，
+     * 由调用方跳过本轮推进。
      *
-     * <ul>
-     *   <li>去程中（DISPATCHED→OUTBOUND）：执行任务中，position_type=空中，
-     *       current_nest_id=NULL（已起飞）</li>
-     *   <li>返航中（HANDOVER→RETURNING）：返航中，position_type=空中</li>
-     *   <li>已完成（RETURNING→FINISHED）：空闲，position_type=原巢，
-     *       current_nest_id=homeNestId（已回巢）</li>
-     *   <li>末段交接中（OUTBOUND→HANDOVER）：执行任务中不变，不回写</li>
-     * </ul>
+     * <p><b>MEDIUM.63</b>：先改订单态、再插 {@code task_log}、最后改无人机状态（条件更新），
+     * 保证审计先于副作用落库。
+     *
+     * @param tsMs 审计时刻，调用方须已用 {@link FlightPhaseTimeline#auditTs} 钳制过，
+     *             保证同订单严格递增且不早于下单时刻
+     * @return 是否真正完成本次迁移写入
      */
-    private void emit(OrderTaskEntity order, OrderStatus from, OrderStatus to,
+    private boolean emit(OrderTaskEntity order, OrderStatus from, OrderStatus to,
             String opType, long tsMs) {
         if (rank(to) != rank(from) + 1) {
             throw new IllegalStateException("飞行阶段流转不连续：" + from.getValue() + " → " + to.getValue());
         }
-        syncDroneStatus(order.getDroneId(), from, to);
-        TaskLogEntity entry = new TaskLogEntity();
-        entry.setOrderId(order.getOrderId());
-        entry.setOpType(opType);
-        entry.setFromStatus(from.getValue());
-        entry.setToStatus(to.getValue());
-        entry.setTs(LocalDateTime.ofInstant(Instant.ofEpochMilli(tsMs), DB_ZONE));
-        taskLogMapper.insert(entry);
-
-        long version = entry.getLogId() != null
-                ? Math.max(2L, entry.getLogId() + 1L)
-                : fallbackVersions.computeIfAbsent(order.getOrderId(), ignored -> new AtomicLong(1L))
-                        .incrementAndGet();
-        try {
-            eventPublisher.publishEvent(new FlightPhaseChangedEvent(new OrderView(
-                    order.getOrderId(), to, tsMs, version, null, null, null, null)));
-        } catch (Exception e) {
-            // 审计已落库，推送失败只告警；下一拍不会重发同一阶段，避免重复刷屏
-            log.warn("飞行阶段广播失败（task_log 已落库）：orderId={} status={} err={}",
-                    order.getOrderId(), to.getValue(), e.getMessage());
-        }
-        log.info("飞行阶段推进：orderId={} {} → {} op={} ts={}",
-                order.getOrderId(), from.getValue(), to.getValue(), opType, tsMs);
-    }
-
-    /** 无人机状态按 23 §7 同步推进。droneMapper 为空（单测未注入）时静默跳过。 */
-    private void syncDroneStatus(String droneId, OrderStatus from, OrderStatus to) {
-        if (droneMapper == null || droneId == null) {
-            return;
-        }
-        var drone = droneMapper.selectById(droneId);
-        if (drone == null) {
-            return;
-        }
-        switch (to) {
-            case OUTBOUND -> {
-                // 起飞 → 执行任务中，已升空
-                drone.setStatus("执行任务中");
-                drone.setPositionType("空中");
-                drone.setCurrentNestId(null);
-            }
-            case HANDOVER -> {
-                // 末段交接中：执行任务中不变，不回写
+        boolean[] written = {false};
+        runInTransaction(() -> {
+            int rows = orderTaskMapper.update(null, new LambdaUpdateWrapper<OrderTaskEntity>()
+                    .eq(OrderTaskEntity::getOrderId, order.getOrderId())
+                    .eq(OrderTaskEntity::getStatus, from.getValue())
+                    .set(OrderTaskEntity::getStatus, to.getValue()));
+            if (rows == 0) {
+                log.error("订单态与飞行阶段不一致，跳过本次审计：orderId={} 期望 {} → {}",
+                        order.getOrderId(), from.getValue(), to.getValue());
                 return;
             }
-            case RETURNING -> {
-                // 返航：返航中，仍在空中
-                drone.setStatus("返航中");
-                drone.setPositionType("空中");
+
+            TaskLogEntity entry = new TaskLogEntity();
+            entry.setOrderId(order.getOrderId());
+            entry.setOpType(opType);
+            entry.setFromStatus(from.getValue());
+            entry.setToStatus(to.getValue());
+            entry.setTs(LocalDateTime.ofInstant(Instant.ofEpochMilli(tsMs), DB_ZONE));
+            taskLogMapper.insert(entry);
+
+            syncDroneStatus(order.getDroneId(), to);
+
+            long version = entry.getLogId() != null
+                    ? Math.max(2L, entry.getLogId() + 1L)
+                    : fallbackVersions.computeIfAbsent(order.getOrderId(), ignored -> new AtomicLong(1L))
+                            .incrementAndGet();
+            try {
+                eventPublisher.publishEvent(new FlightPhaseChangedEvent(new OrderView(
+                        order.getOrderId(), to, tsMs, version, null, null, null, null)));
+            } catch (Exception e) {
+                // 审计已落库，推送失败只告警；下一拍不会重发同一阶段，避免重复刷屏
+                log.warn("飞行阶段广播失败（task_log 已落库）：orderId={} status={} err={}",
+                        order.getOrderId(), to.getValue(), e.getMessage());
             }
-            case FINISHED -> {
-                // 已完成：空闲，回原巢
-                drone.setStatus("空闲");
-                drone.setPositionType("原巢");
-                drone.setCurrentNestId(drone.getHomeNestId());
-            }
-            default -> {
-                return; // 非飞行阶段迁移（保险）
-            }
+            written[0] = true;
+        });
+        if (written[0]) {
+            log.info("飞行阶段推进：orderId={} {} → {} op={} ts={}",
+                    order.getOrderId(), from.getValue(), to.getValue(), opType, tsMs);
         }
-        droneMapper.updateById(drone);
+        return written[0];
+    }
+
+    /** 在事务模板存在时包裹执行；测试无 Spring 事务时退化为直接执行。 */
+    private void runInTransaction(Runnable action) {
+        TransactionTemplate template = this.transactionTemplate;
+        if (template == null) {
+            action.run();
+            return;
+        }
+        template.execute(status -> {
+            action.run();
+            return null;
+        });
     }
 
     /**
-     * 从 task_log 取该订单最近一次飞行态迁移；无记录时返回 {@code null}。
-     * 只认飞行态四值，订单受理链的日志不得被误当飞行阶段。
+     * 无人机状态按 23 §7 同步推进（MEDIUM.63：条件更新，不做整行覆盖）。
+     *
+     * <p>在 {@code task_log} 落库之后调用；{@code HANDOVER} 不改无人机状态。
      */
-    private OrderStatus lastFlightPhase(String orderId) {
+    private void syncDroneStatus(String droneId, OrderStatus to) {
+        if (droneMapper == null || droneId == null) {
+            return;
+        }
+        LambdaUpdateWrapper<DroneEntity> update = new LambdaUpdateWrapper<DroneEntity>()
+                .eq(DroneEntity::getDroneId, droneId);
+        switch (to) {
+            case OUTBOUND -> update
+                    .set(DroneEntity::getStatus, "执行任务中")
+                    .set(DroneEntity::getPositionType, "空中")
+                    .set(DroneEntity::getCurrentNestId, null);
+            case RETURNING -> update
+                    .set(DroneEntity::getStatus, "返航中")
+                    .set(DroneEntity::getPositionType, "空中");
+            case FINISHED -> {
+                DroneEntity drone = droneMapper.selectById(droneId);
+                if (drone == null) {
+                    return;
+                }
+                update.set(DroneEntity::getStatus, "空闲")
+                        .set(DroneEntity::getPositionType, "原巢")
+                        .set(DroneEntity::getCurrentNestId, drone.getHomeNestId());
+            }
+            default -> {
+                return; // 末段交接中（HANDOVER）等不回写
+            }
+        }
+        droneMapper.update(null, update);
+    }
+
+    /**
+     * 从 task_log 取本派发周期已发生的最后一段飞行态迁移（阶段＋审计时刻）。
+     *
+     * <p>只认飞行态四值，订单受理链的日志不得被误当飞行阶段。
+     *
+     * <p><b>MEDIUM.64</b>：以「派发」日志为周期边界；边界缺失时记 warn 并返回 {@code null}，
+     * 不再退化为「不加过滤地取历史飞行日志」（那会把上一周期串进来）。
+     *
+     * <p>同时带回该条日志的时刻，作为后续审计时刻的下界——这是「时间不倒挂」的锚点：
+     * 重建后写下的第一条审计必须晚于本周期已有的最后一条。
+     *
+     * @return 阶段与审计时刻；本周期尚无飞行日志时阶段为「已派发」、时刻为派发时刻；
+     *         周期边界缺失时 {@code null}
+     */
+    private CyclePhase lastCyclePhase(String orderId) {
         TaskLogEntity lastDispatch = taskLogMapper.selectOne(
                 new LambdaQueryWrapper<TaskLogEntity>()
                         .eq(TaskLogEntity::getOrderId, orderId)
                         .eq(TaskLogEntity::getOpType, DISPATCH_OP_TYPE)
                         .orderByDesc(TaskLogEntity::getLogId)
                         .last("LIMIT 1"));
+        if (lastDispatch == null || lastDispatch.getLogId() == null) {
+            log.warn("周期边界缺失（无派发日志），本轮不按历史飞行日志推进：orderId={}", orderId);
+            return null;
+        }
+        long dispatchMs = toEpochMs(lastDispatch.getTs());
         LambdaQueryWrapper<TaskLogEntity> query = new LambdaQueryWrapper<TaskLogEntity>()
                 .eq(TaskLogEntity::getOrderId, orderId)
                 .in(TaskLogEntity::getToStatus, FLIGHT_PHASES.stream()
-                        .map(OrderStatus::getValue).toList());
-        if (lastDispatch != null && lastDispatch.getLogId() != null) {
-            // 重派会复用同一 orderId：只认本次「派发」之后的飞行日志，避免上一周期串线
-            query.gt(TaskLogEntity::getLogId, lastDispatch.getLogId());
-        }
-        List<TaskLogEntity> logs = taskLogMapper.selectList(
-                query.orderByDesc(TaskLogEntity::getLogId).last("LIMIT 1"));
+                        .map(OrderStatus::getValue).toList())
+                .gt(TaskLogEntity::getLogId, lastDispatch.getLogId())
+                .orderByDesc(TaskLogEntity::getLogId)
+                .last("LIMIT 1");
+        List<TaskLogEntity> logs = taskLogMapper.selectList(query);
         if (logs == null || logs.isEmpty()) {
-            return null;
+            return new CyclePhase(OrderStatus.DISPATCHED, dispatchMs);
         }
-        String value = logs.get(0).getToStatus();
+        TaskLogEntity last = logs.get(0);
+        String value = last.getToStatus();
         for (OrderStatus status : FLIGHT_PHASES) {
             if (status.getValue().equals(value)) {
-                return status;
+                return new CyclePhase(status, toEpochMs(last.getTs()));
             }
         }
-        return null;
+        return new CyclePhase(OrderStatus.DISPATCHED, dispatchMs);
+    }
+
+    /** 审计时刻下界：下单时刻与本周期已有审计取大者，保证任务日志不早于下单时刻。 */
+    private static long auditFloorMs(OrderTaskEntity order, CyclePhase cycle) {
+        long floorMs = toEpochMs(order.getCreateTime());
+        return cycle == null ? floorMs : Math.max(floorMs, cycle.floorMs());
+    }
+
+    /** 订单已完成：清理该订单的全部进程内缓存（HIGH.3）。 */
+    private void evictOrder(String orderId) {
+        cycleStates.remove(orderId);
+        fallbackVersions.remove(orderId);
+        contextRetryAfterMs.remove(orderId);
+        warnedMissingContext.removeIf(key -> key.startsWith(orderId + "@"));
+    }
+
+    private void warnMissingContext(String orderId, long meetMs, String droneId) {
+        if (warnedMissingContext.size() >= WARN_KEY_CAPACITY) {
+            warnedMissingContext.clear();
+        }
+        if (warnedMissingContext.add(warnKey(orderId, meetMs))) {
+            log.warn("飞行阶段推进缺执行机上下文，跳过：orderId={} droneId={}", orderId, droneId);
+        }
+    }
+
+    private static String warnKey(String orderId, long meetMs) {
+        return orderId + "@" + meetMs;
     }
 
     private static int rank(OrderStatus status) {
@@ -414,10 +617,42 @@ public class FlightPhaseAdvancer {
     }
 
     private static long toEpochMs(LocalDateTime time) {
-        return time.atZone(DB_ZONE).toInstant().toEpochMilli();
+        return time == null ? 0L : time.atZone(DB_ZONE).toInstant().toEpochMilli();
     }
 
-    /** 一次派发周期内的缓存，meet_time 或执行机变化即视为新周期。 */
-    private record CycleState(long meetMs, String droneId, OrderStatus phase, DroneContext drone) {
+    /** task_log 落库时刻；缺失按 0 处理，由调用方与下单时刻取大者兜底。 */
+    private static long toEpochMs(TaskLogEntity log) {
+        return toEpochMs(log.getTs());
+    }
+
+    /** 一次派发周期在库里的落点：当前阶段＋该阶段审计时刻（MEDIUM.64 的周期边界）。 */
+    private record CyclePhase(OrderStatus phase, long floorMs) {
+    }
+
+    /**
+     * 一次派发周期内的缓存。
+     *
+     * <p>{@code floorMs} 是本周期最后一条审计的时刻，用于钳制下一次写入，保证
+     * {@code task_log.ts} 严格递增；{@code stale} 表示订单态已变化、下一拍须重建
+     * （重建前仍留在缓存里，供实时出口继续取到该机在飞订单）。
+     */
+    private record CycleState(long meetMs, String droneId, OrderStatus phase, DroneContext drone,
+            long floorMs, boolean stale) {
+
+        /** 按库里的真实落点新建一个可用周期。 */
+        static CycleState fresh(long meetMs, String droneId, OrderStatus phase, DroneContext drone,
+                long floorMs) {
+            return new CycleState(meetMs, droneId, phase, drone, floorMs, false);
+        }
+
+        /** 推进到下一阶段，并把审计下界前移到本次写入时刻。 */
+        CycleState advanceTo(OrderStatus next, long emittedMs) {
+            return new CycleState(meetMs, droneId, next, drone, emittedMs, false);
+        }
+
+        /** 标记待重建；已标记则原样返回，避免重复建对象。 */
+        CycleState markStale() {
+            return stale ? this : new CycleState(meetMs, droneId, phase, drone, floorMs, true);
+        }
     }
 }

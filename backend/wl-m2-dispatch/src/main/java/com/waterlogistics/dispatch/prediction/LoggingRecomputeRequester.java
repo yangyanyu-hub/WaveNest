@@ -59,6 +59,10 @@ public class LoggingRecomputeRequester implements RecomputeRequester {
 
     @Override
     public void requestRecompute(RecomputeRequest request) {
+        if (request == null) {
+            log.warn("重算请求为空，忽略（调用方不应传 null）");
+            return;
+        }
         record(request);
         log.info("重算请求：mmsi={} 版本={} 航向 {}° → {}°（变化 {}°，原因={}）",
                 request.mmsi(), request.snapshotVersion(),
