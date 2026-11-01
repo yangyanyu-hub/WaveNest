@@ -1,6 +1,7 @@
 package com.waterlogistics.dispatch.record;
 
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
@@ -45,12 +46,15 @@ public final class MonitorController {
     /**
      * 任务列表（下单时刻倒序）。
      *
-     * <p>空库返回 {@code {"tasks":[],"total":0}}，<b>不返回 404</b>——
+     * <p>{@code page} 从 1 开始，默认 1；{@code size} 默认 50、上限 200。
+     * {@code total} 为本页返回条数。空库返回 {@code {"tasks":[],"total":0}}，<b>不返回 404</b>——
      * 「库里还没有任务」与「这个任务不存在」是两件事，空列表是正确语义。
      */
     @GetMapping(MONITOR_TASKS)
-    public MonitorAggregator.TasksResponse tasks() {
-        return monitorQueryService.tasks();
+    public MonitorAggregator.TasksResponse tasks(
+            @RequestParam(defaultValue = "1") int page,
+            @RequestParam(defaultValue = "50") int size) {
+        return monitorQueryService.tasks(page, size);
     }
 
     /**
