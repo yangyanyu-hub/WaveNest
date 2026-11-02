@@ -62,7 +62,8 @@ public class FeasibilityJudge {
      * 判定一个候选组合的可行性（简化规则）。
      *
      * @param combo        候选生成输出（<b>自带机型抗风上限</b>，见 {@link CandidateGenerator.CandidateCombo#windLimitMs()}）
-     * @param distKm       本次任务单程距离（km，调用方按取货点→交货点或机巢→取货点口径传入）
+     * @param distKm       本次任务主航段单程距离（km，取货点→交货点，调用方按订单给；
+     *                     机巢→取货段由 {@link CandidateGenerator.CandidateCombo#distKm()} 提供，本方法自动计入）
      * @param worstWindMs  现场最不利风速（m/s；首版实测代偿，取自 data.weather 按位置取最不利）
      * @param payloadKg    订单载荷（kg，载荷附加耗电用）
      * @param params       判定参数
@@ -104,20 +105,25 @@ public class FeasibilityJudge {
                     worstWindMs, params.maxWindMs()));
         }
 
-        // 2) 电量闸（往返粗估：去程 dist + 回程 dist，简化按同距离）
-        //    已知欠账（Open CodeReview 指出）：真实的往返是「巢→取货点→交货点→巢」三段，
-        //    这里只算了「取货↔交货」两段，巢→取货一段未计入，电量闸系统性偏乐观。
-        //    调用方（CandidateService）传的是主航段单程距离，无巢→取货数据可用；
-        //    待 51 清单 #19（航迹生成接入派发）后改为按真实任务航迹累计里程，
-        //    在那之前此闸只当粗筛用，不作为电量安全的最终依据。
-        double roundTripKm = 2.0 * distKm;
-        double consume = roundTripKm * params.batteryPerKmPercent()
+        // 2) 电量闸（三段里程估算：巢→取货→交货 + 交货→巢）
+        //    <p>taskDistKm 是调用方传的「取货点→交货点」单程；<b>机巢→取货段由
+        //    combo 自带的 distKm 提供</b>（CandidateGenerator 用 haversine 算好的
+        //    「巢→取货点」距离）。真实航程 = 巢→取 + 取→交 + 交→巢。
+        //    交货→巢一段没有交货点坐标无法精确计算，按<b>保守上界</b>取
+        //    「巢→取 + 取→交」（把交货点视作在取货点外侧 taskDistKm 处）——
+        //    宁可多算能耗，不漏算。<b>此前只算 2×taskDistKm，机巢→取货的往返整段
+        //    漏掉，电量闸系统性偏乐观（Open CodeReview 点出、已修）</b>。
+        //    后续 51 清单 #19（航迹生成接入派发）后改为按真实任务航迹累计里程。
+        double totalKm = 2.0 * (distKm + combo.distKm());
+        double consume = totalKm * params.batteryPerKmPercent()
                 + payloadKg * params.batteryPerKgPercent();
         double remaining = combo.battery() - consume;
         if (remaining < params.reserveBatteryPercent()) {
             reasons.add(String.format(
-                    "电量不足：%.0f%% − 往返 %.1fkm × %.1f%%/km − 载荷附加 ≈ 余 %.0f%% < 保留 %.0f%%",
-                    combo.battery(), roundTripKm, params.batteryPerKmPercent(),
+                    "电量不足：%.0f%% − 三段里程 %.1fkm（巢↔取 %.1f + 取↔交 %.1f）× %.1f%%/km"
+                            + " − 载荷附加 ≈ 余 %.0f%% < 保留 %.0f%%",
+                    combo.battery(), totalKm, 2.0 * combo.distKm(), 2.0 * distKm,
+                    params.batteryPerKmPercent(),
                     remaining, params.reserveBatteryPercent()));
         }
 

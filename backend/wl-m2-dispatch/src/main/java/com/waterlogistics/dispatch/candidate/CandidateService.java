@@ -44,12 +44,11 @@ public class CandidateService {
      * 生成候选并对每个组合做简化可行性判断（10-16 成对口径）。
      *
      * @param input        候选生成输入
-     * @param taskDistKm   本次任务主航段距离（km，取货点→交货点，调用方按订单给）
-     *                    <p><b>语义注意（Open CodeReview 指出的文档-实现错位）</b>：
-     *                    {@link FeasibilityJudge#judge} 内部按<b>往返</b> {@code 2.0 × distKm}
-     *                    计能耗，且<b>巢→取货点一段未计入</b>——电量闸因此系统性偏乐观。
-     *                    调用方传「取货点→交货点单程」即可与现状对齐；巢→取货段的欠账
-     *                    待 51 清单 #19（航迹生成接入）后由真实任务航迹补上，见 judge 侧注释。
+     * @param taskDistKm   本次任务主航段距离（km，取货点→交货点，调用方按订单给）。
+     *                    <p><b>口径（已修，原为文档-实现错位）</b>：{@link FeasibilityJudge#judge}
+     *                    现按三段估算总里程——{@code 2×taskDistKm}（取↔交）＋
+     *                    {@code 2×combo.distKm()}（巢↔取，由生成器用 haversine 算好随组合透传）。
+     *                    交货→巢按保守上界并入，不再漏算机巢段。
      * @param worstWindMs  现场最不利风速（m/s，取自 data.weather 按位置取最不利）
      * @param genParams    候选生成参数
      * <p><b>入口非有限值守卫（评审 HIGH.8 · 硬判据 3）</b>：{@code taskDistKm} 与

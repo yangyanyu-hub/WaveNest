@@ -8,6 +8,8 @@ import com.waterlogistics.storage.entity.OrderTaskEntity;
 import java.math.BigDecimal;
 import java.util.Arrays;
 import java.util.List;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 /**
  * 候选输入组装器——{@code CandidateFeasibilityPlanner} 与 {@code CandidateSelector}
@@ -18,6 +20,8 @@ import java.util.List;
  * 本类只负责<b>查出来的行 → {@link CandidateInput}</b> 的纯组装。
  */
 public final class CandidateInputAssembler {
+
+    private static final Logger log = LoggerFactory.getLogger(CandidateInputAssembler.class);
 
     private CandidateInputAssembler() {
     }
@@ -43,13 +47,17 @@ public final class CandidateInputAssembler {
 
         List<CandidateInput.NestView> nestViews = new java.util.ArrayList<>();
         for (NestEntity n : nests) {
+            // 机巢坐标缺失 ⇒ 跳过该巢并 warn（原为填 (0,0) 静默被距离淘汰——
+            // 结果方向虽安全，但现场同样看不出原因；跳过+日志让数据问题显形。
+            // 机巢是系统台账数据而非订单数据，不宜抛单，缺失应修台账。）
+            if (n.getLon() == null || n.getLat() == null) {
+                log.warn("机巢 {} 缺少经纬度，本轮候选不纳入——请补全台账（nest.lon/lat）", n.getNestId());
+                continue;
+            }
             nestViews.add(new CandidateInput.NestView(
                     n.getNestId(),
-                    // 机巢坐标缺失按 0.0 立此存照（Open CodeReview 未点名，但属 MEDIUM.13 同款）：
-                    // 缺坐标的巢会被挪到 (0,0) 然后被距离上限淘汰——结果方向安全（不会派向假巢），
-                    // 但静默。机巢是系统台账数据而非订单数据，不宜抛单；缺失应修台账。
-                    n.getLon() != null ? n.getLon().doubleValue() : 0.0,
-                    n.getLat() != null ? n.getLat().doubleValue() : 0.0,
+                    n.getLon().doubleValue(),
+                    n.getLat().doubleValue(),
                     splitModels(n.getSupportedModels())));
         }
 

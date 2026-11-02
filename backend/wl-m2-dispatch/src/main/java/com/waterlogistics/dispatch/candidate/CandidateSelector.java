@@ -74,7 +74,10 @@ public class CandidateSelector {
         if (combos.isEmpty()) {
             return null;
         }
-        // CandidateGenerator 已按距离升序，取第一个即为最优（简化）
+        // CandidateGenerator 已按距离升序，取第一个即为最优（简化）。
+        // 注意（Open CodeReview）：该排序契约未在本类与生成器之间显式声明，
+        // 生成器排序键变更（如接入 rank_key）时这里须同步——生产主链已不走本类
+        // （DispatchOrchestrator 走 CandidateFeasibilityPlanner），本类保留待组长裁定去留。
         return combos.get(0);
     }
 
