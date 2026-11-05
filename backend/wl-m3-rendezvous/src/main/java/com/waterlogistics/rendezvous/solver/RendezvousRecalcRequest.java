@@ -1,5 +1,9 @@
 package com.waterlogistics.rendezvous.solver;
 
+import com.waterlogistics.algo.meeting.model.EpochMillis;
+
+import com.waterlogistics.rendezvous.support.WireText;
+
 import java.util.Objects;
 import java.util.regex.Pattern;
 
@@ -49,7 +53,14 @@ public record RendezvousRecalcRequest(
 
         RecalcStateSnapshot stateSnapshot) {
 
-    private static final Pattern PATTERN = Pattern.compile("\\d{9}");
+    private static final Pattern MMSI_PATTERN = Pattern.compile("[0-9]{9}");
+
+    private static final Pattern UNSAFE = Pattern.compile("[\\p{Cc}\\p{Cf}\\p{Zl}\\p{Zp}]");
+
+    private static final int MAX_ID_LENGTH = 64;
+
+    private static final int MAX_REASON_LENGTH = 256;
+    private static final Pattern PATTERN = Pattern.compile("^[\\p{Z}\\s]+|[\\p{Z}\\s]+$");
 
 
 
@@ -61,23 +72,86 @@ public record RendezvousRecalcRequest(
         Objects.requireNonNull(snapshotVersion, "snapshotVersion 不能为空");
         Objects.requireNonNull(shipMmsi, "shipMmsi 不能为空");
         Objects.requireNonNull(stateSnapshot, "stateSnapshot 不能为空");
-        requestId = requestId.strip();
-        droneId = droneId.strip();
-        snapshotVersion = snapshotVersion.strip();
-        shipMmsi = shipMmsi.strip();
-        orderId = orderId == null ? null : orderId.strip();
-        triggerReason = triggerReason == null ? null : triggerReason.strip();
-        if (requestId.isBlank() || droneId.isBlank() || snapshotVersion.isBlank()) {
+        requestId = RendezvousRecalcRequest.safeIdentifier(
+                RendezvousRecalcRequest.trimSpaces(requestId), "requestId");
+        droneId = RendezvousRecalcRequest.safeIdentifier(
+                RendezvousRecalcRequest.trimSpaces(droneId), "droneId");
+        snapshotVersion = RendezvousRecalcRequest.safeIdentifier(
+                RendezvousRecalcRequest.trimSpaces(snapshotVersion), "snapshotVersion");
+        shipMmsi = RendezvousRecalcRequest.trimSpaces(shipMmsi);
+        if (shipMmsi.isEmpty()) {
+            throw new IllegalArgumentException("shipMmsi 不能为空白字符串");
+        }
+        orderId = RendezvousRecalcRequest.blankToNull(orderId);
+        triggerReason = RendezvousRecalcRequest.blankToNull(triggerReason);
+        if (requestId.isEmpty() || droneId.isEmpty() || snapshotVersion.isEmpty()) {
             throw new IllegalArgumentException("requestId/droneId/snapshotVersion 不能为空白字符串");
         }
-        if ((orderId != null && orderId.isBlank()) || (triggerReason != null && triggerReason.isBlank())) {
-            throw new IllegalArgumentException("orderId/triggerReason 若提供则不能为空白字符串");
+        if (orderId != null) {
+            orderId = RendezvousRecalcRequest.safeIdentifier(orderId, "orderId");
         }
-        if (!RendezvousRecalcRequest.PATTERN.matcher(shipMmsi).matches()) {
-            throw new IllegalArgumentException("shipMmsi 须为 9 位数字，实际 " + shipMmsi);
+        if (triggerReason != null) {
+            triggerReason = RendezvousRecalcRequest.safeTriggerReason(triggerReason);
         }
-        if (timestamp < 1_000_000_000_000L) {
-            throw new IllegalArgumentException("请求时刻须为 Unix 毫秒值（疑似误传秒级时间戳），实际 " + timestamp);
+        if (!RendezvousRecalcRequest.MMSI_PATTERN.matcher(shipMmsi).matches()) {
+            throw new IllegalArgumentException("shipMmsi 须为 9 位数字，实际长度 " + shipMmsi.length()
+                                                       + "，值 '" + WireText.escapeForLog(shipMmsi) + "'");
         }
+        if (!EpochMillis.isValid(timestamp)) {
+            throw new IllegalArgumentException("请求时刻须为 Unix 毫秒值（范围 ["
+                                                       + EpochMillis.MIN_VALID_MS + ", " + EpochMillis.MAX_VALID_MS + "]），实际 " + timestamp);
+        }
+    }
+
+
+
+
+
+    private static String blankToNull(CharSequence value) {
+        String stripped = RendezvousRecalcRequest.trimSpaces(value);
+        return stripped == null || stripped.isEmpty() ? null : stripped;
+    }
+
+
+
+
+
+    private static String trimSpaces(CharSequence value) {
+        if (value == null) {
+            return null;
+        }
+        return RendezvousRecalcRequest.PATTERN.matcher(value).replaceAll("");
+    }
+
+
+
+
+
+    private static String safeIdentifier(String value, String field) {
+        if (value == null) {
+            throw new IllegalArgumentException(field + " 不能为空");
+        }
+        if (value.isEmpty() || value.length() > RendezvousRecalcRequest.MAX_ID_LENGTH
+                || RendezvousRecalcRequest.UNSAFE.matcher(value).find()
+                || value.chars().anyMatch(Character::isWhitespace)
+                || value.chars().anyMatch(Character::isSpaceChar)) {
+            throw new IllegalArgumentException(field + " 非法：长度、空白或字符不在允许范围内");
+        }
+        return value;
+    }
+
+
+
+
+
+    private static String safeTriggerReason(String value) {
+        if (value == null) {
+            return null;
+        }
+        if (value.length() > RendezvousRecalcRequest.MAX_REASON_LENGTH
+                || RendezvousRecalcRequest.UNSAFE.matcher(value).find()) {
+            throw new IllegalArgumentException("triggerReason 非法：长度或字符不在允许范围内");
+        }
+        return value;
     }
 }

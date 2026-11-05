@@ -1,5 +1,7 @@
 package com.waterlogistics.rendezvous.handover;
 
+import com.waterlogistics.algo.meeting.model.EpochMillis;
+
 import java.util.List;
 import java.util.Objects;
 
@@ -38,18 +40,31 @@ public record HandoverCommand(
         Objects.requireNonNull(taskId, "taskId 不能为空");
         Objects.requireNonNull(droneId, "droneId 不能为空");
         Objects.requireNonNull(params, "params 不能为空");
-        if (taskId.isBlank() || droneId.isBlank()) {
+        taskId = taskId.strip();
+        droneId = droneId.strip();
+        if (taskId.isEmpty() || droneId.isEmpty()) {
             throw new IllegalArgumentException("taskId/droneId 不能为空白字符串");
         }
-        if (plannedMeetT <= 0L) {
-            throw new IllegalArgumentException("计划会面时刻必须为正的 Unix 毫秒值，实际 " + plannedMeetT);
+        if (!EpochMillis.isValid(plannedMeetT)) {
+            throw new IllegalArgumentException("计划会面时刻须为 Unix 毫秒值（范围 ["
+                                                       + EpochMillis.MIN_VALID_MS + ", "
+                                                       + EpochMillis.MAX_VALID_MS + "]），实际 " + plannedMeetT);
         }
         if (!Double.isFinite(plannedMeetLon) || !Double.isFinite(plannedMeetLat)
                 || plannedMeetLon < -180.0 || plannedMeetLon > 180.0
                 || plannedMeetLat < -90.0 || plannedMeetLat > 90.0) {
             throw new IllegalArgumentException("计划会面点坐标必须为有限数且经纬度在合法范围内");
         }
-        samples = List.copyOf(Objects.requireNonNull(samples, "samples 不能为空"));
+        // 先做不可变快照再校验，避免校验与保存看到两个不同的列表状态。
+        // 用带生成器的 toArray 一次分配定长数组，避免先分配零长度数组再被复制
+        HandoverSample[] raw = Objects.requireNonNull(samples, "samples 不能为空")
+                .toArray(HandoverSample[]::new);
+        for (HandoverSample sample : raw) {
+            if (sample == null) {
+                throw new IllegalArgumentException("末段样本序列不得包含 null 元素");
+            }
+        }
+        samples = List.of(raw);
         if (samples.isEmpty()) {
             throw new IllegalArgumentException("末段样本序列不能为空");
         }

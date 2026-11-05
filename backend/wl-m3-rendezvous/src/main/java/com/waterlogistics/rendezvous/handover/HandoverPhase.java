@@ -1,5 +1,6 @@
 package com.waterlogistics.rendezvous.handover;
 
+import com.waterlogistics.rendezvous.support.WireText;
 import lombok.Getter;
 
 
@@ -44,8 +45,12 @@ public enum HandoverPhase {
 
 
 
-    HandoverPhase(String value) {
-        this.value = value;
+    HandoverPhase(CharSequence value) {
+        String normalized = WireText.normalizeToken(value);
+        if (normalized == null || normalized.isEmpty()) {
+            throw new IllegalArgumentException("末段子阶段口径词不能为空：" + this.name());
+        }
+        this.value = normalized;
     }
 
 
@@ -59,16 +64,19 @@ public enum HandoverPhase {
      * @return 对应的末段子阶段
      * @throws IllegalArgumentException 入参为空/空白或无匹配口径词
      */
-    public static HandoverPhase fromValue(String value) {
-        if (value == null || value.isBlank()) {
+    public static HandoverPhase fromValue(CharSequence value) {
+        if (value == null) {
             throw new IllegalArgumentException("末段子阶段不能为空");
         }
-        String normalized = value.replace('\u00A0', ' ').strip();
+        String normalized = WireText.normalizeToken(value);
+        if (normalized.isEmpty()) {
+            throw new IllegalArgumentException("末段子阶段不能为空");
+        }
         for (HandoverPhase phase : HandoverPhase.values()) {
             if (phase.value.equals(normalized)) {
                 return phase;
             }
         }
-        throw new IllegalArgumentException("未知末段子阶段：" + normalized);
+        throw new IllegalArgumentException("未知末段子阶段：" + WireText.escapeForLog(normalized));
     }
 }

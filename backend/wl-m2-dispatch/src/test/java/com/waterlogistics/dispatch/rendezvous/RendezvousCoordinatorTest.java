@@ -10,7 +10,11 @@ import com.waterlogistics.algo.meeting.model.NoSolutionReason;
 import com.waterlogistics.algo.meeting.model.ShipPoint;
 import com.waterlogistics.algo.meeting.model.ShipTrackSnapshot;
 import com.waterlogistics.algo.meeting.model.Wind;
+import com.waterlogistics.contract.mq.WeatherData;
+import com.waterlogistics.dispatch.weather.WeatherSnapshotAdapter;
 import com.waterlogistics.dispatch.weather.WeatherSnapshotPort;
+import com.waterlogistics.dispatch.weather.WeatherSettings;
+import com.waterlogistics.dispatch.weather.WeatherSnapshotStore;
 import com.waterlogistics.rendezvous.facade.RendezvousFacade;
 import com.waterlogistics.rendezvous.port.DroneContext;
 import com.waterlogistics.rendezvous.solver.RendezvousCommand;
@@ -52,14 +56,14 @@ class RendezvousCoordinatorTest {
     }
 
     private static DroneContext droneContext() {
-        return new DroneContext("DRONE-1", "NEST-A", 120.10, 30.20, 12.0, null);
+        return new DroneContext("DRONE-1", "NEST-A", "NEST-A", 120.10, 30.20, 12.0, null);
     }
 
     /** 有解时的正常路径：会面点、起飞时刻、解标识、快照版本都要回传给调度链 */
     @Test
     void solveFor_shouldReturnMeetPlanWhenSolvable() {
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
-                new StubbedFacade(true), id -> droneContext(), mmsi -> snapshot(), sysParams(), () -> null);
+                new StubbedFacade(true), id -> droneContext(), mmsi -> snapshot(), sysParams(), (lon, lat, now) -> null);
 
         RendezvousCoordinator.MeetPlan plan = coordinator.solveFor(order(), "COMBO-1", "DRONE-1");
 
@@ -67,7 +71,7 @@ class RendezvousCoordinatorTest {
         assertEquals(115.0, plan.meetLon(), 1e-9, "会面点经度取算法层结果");
         assertEquals(29.0, plan.meetLat(), 1e-9, "会面点纬度取算法层结果");
         assertEquals(LocalDateTime.ofInstant(Instant.ofEpochMilli(MEET_T_MS),
-                ZoneId.of("Asia/Shanghai")), plan.takeoffTime(),
+                ZoneId.of("Asia/Shanghai")), plan.meetTime(),
                 "起飞时刻取会面时刻最早上界、且已转本地时区");
         assertEquals("SOL-1", plan.solutionId(), "解标识须回传便于留痕");
         assertEquals("1", plan.snapshotVersion(), "快照版本须与 M2 常驻层一致");
@@ -77,7 +81,7 @@ class RendezvousCoordinatorTest {
     @Test
     void solveFor_shouldRejectWhenDroneLedgerMissing() {
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
-                new StubbedFacade(true), id -> null, mmsi -> snapshot(), sysParams(), () -> null);
+                new StubbedFacade(true), id -> null, mmsi -> snapshot(), sysParams(), (lon, lat, now) -> null);
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
                 () -> coordinator.solveFor(order(), "COMBO-1", "DRONE-X"));
@@ -90,7 +94,7 @@ class RendezvousCoordinatorTest {
     @Test
     void solveFor_shouldRejectWhenSnapshotMissing() {
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
-                new StubbedFacade(true), id -> droneContext(), mmsi -> null, sysParams(), () -> null);
+                new StubbedFacade(true), id -> droneContext(), mmsi -> null, sysParams(), (lon, lat, now) -> null);
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
                 () -> coordinator.solveFor(order(), "COMBO-1", "DRONE-1"));
@@ -103,7 +107,7 @@ class RendezvousCoordinatorTest {
     @Test
     void solveFor_shouldRejectWhenUnsolvable() {
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
-                new StubbedFacade(false), id -> droneContext(), mmsi -> snapshot(), sysParams(), () -> null);
+                new StubbedFacade(false), id -> droneContext(), mmsi -> snapshot(), sysParams(), (lon, lat, now) -> null);
 
         IllegalStateException thrown = assertThrows(IllegalStateException.class,
                 () -> coordinator.solveFor(order(), "COMBO-1", "DRONE-1"));
@@ -118,7 +122,7 @@ class RendezvousCoordinatorTest {
         StubbedFacade facade = new StubbedFacade(true);
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
                 facade, id -> droneContext(), mmsi -> snapshot(), sysParams(),
-                () -> new WeatherSnapshotPort.LatestWind(4.5, 300.0, MEET_T_MS));
+                (lon, lat, now) -> new WeatherSnapshotPort.LatestWind(4.5, 300.0, MEET_T_MS));
 
         coordinator.solveFor(order(), "COMBO-1", "DRONE-1");
 
@@ -147,7 +151,7 @@ class RendezvousCoordinatorTest {
             }
         };
         RendezvousCoordinator coordinator = new RendezvousCoordinator(
-                facade, id -> droneContext(), mmsi -> snapshot(), params, () -> null);
+                facade, id -> droneContext(), mmsi -> snapshot(), params, (lon, lat, now) -> null);
 
         coordinator.solveFor(order(), "COMBO-1", "DRONE-1");
 
@@ -160,19 +164,46 @@ class RendezvousCoordinatorTest {
     @Test
     void solveFor_shouldShiftPlanWithWindFromSnapshot() {
         RendezvousCoordinator headwind = new RendezvousCoordinator(
-                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null),
+                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null)::solve,
                 id -> droneContextAt(15.0), mmsi -> movingSnapshot(), sysParams(),
-                () -> new WeatherSnapshotPort.LatestWind(3.0, 90.0, MEET_T_MS));
+                (lon, lat, now) -> new WeatherSnapshotPort.LatestWind(3.0, 90.0, MEET_T_MS));
         RendezvousCoordinator tailwind = new RendezvousCoordinator(
-                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null),
+                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null)::solve,
                 id -> droneContextAt(15.0), mmsi -> movingSnapshot(), sysParams(),
-                () -> new WeatherSnapshotPort.LatestWind(3.0, 270.0, MEET_T_MS));
+                (lon, lat, now) -> new WeatherSnapshotPort.LatestWind(3.0, 270.0, MEET_T_MS));
 
         RendezvousCoordinator.MeetPlan head = headwind.solveFor(order(), "COMBO-1", "DRONE-1");
         RendezvousCoordinator.MeetPlan tail = tailwind.solveFor(order(), "COMBO-1", "DRONE-1");
 
-        assertTrue(tail.takeoffTime().isBefore(head.takeoffTime()),
-                "顺风应更早会面：逆风 " + head.takeoffTime() + "，顺风 " + tail.takeoffTime());
+        assertTrue(tail.meetTime().isBefore(head.meetTime()),
+                "顺风应更早会面：逆风 " + head.meetTime() + "，顺风 " + tail.meetTime());
+    }
+
+    /** 气象快照仓到适配器再到协调器：顺风应比逆风更早会面。 */
+    @Test
+    void solveFor_shouldConsumeWindFromStore() {
+        long now = System.currentTimeMillis();
+        RendezvousCoordinator headwind = new RendezvousCoordinator(
+                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null)::solve,
+                id -> droneContextAt(15.0), mmsi -> movingSnapshot(), sysParams(),
+                new WeatherSnapshotAdapter(storeWithWind(now, 90.0)));
+        RendezvousCoordinator tailwind = new RendezvousCoordinator(
+                new RendezvousFacade(mmsi -> movingSnapshot(), id -> null)::solve,
+                id -> droneContextAt(15.0), mmsi -> movingSnapshot(), sysParams(),
+                new WeatherSnapshotAdapter(storeWithWind(now, 270.0)));
+
+        RendezvousCoordinator.MeetPlan head = headwind.solveFor(order(), "COMBO-1", "DRONE-1");
+        RendezvousCoordinator.MeetPlan tail = tailwind.solveFor(order(), "COMBO-1", "DRONE-1");
+
+        assertTrue(tail.meetTime().isBefore(head.meetTime()),
+                "顺风应更早会面：逆风 " + head.meetTime() + "，顺风 " + tail.meetTime());
+    }
+
+    private static WeatherSnapshotStore storeWithWind(long obsMs, double dirDeg) {
+        WeatherSnapshotStore store = new WeatherSnapshotStore(WeatherSettings.defaults());
+        store.accept(new WeatherData(LON0 - GAP_M / mPerDegLon(LAT0), LAT0,
+                3.0, dirDeg, 0.0, obsMs, obsMs, obsMs));
+        return store;
     }
 
     /** 求解阈值桩：全部回缺省，代表库里没登记新键的情形 */
@@ -196,13 +227,13 @@ class RendezvousCoordinatorTest {
     }
 
     private static DroneContext droneContextAt(double cruiseMs) {
-        return new DroneContext("DRONE-1", "NEST-A",
+        return new DroneContext("DRONE-1", "NEST-A", "NEST-A",
                 LON0 - GAP_M / mPerDegLon(LAT0), LAT0, cruiseMs, null);
     }
 
     /** 匀速直线船迹：自当前时刻起东行 5 m/s，覆盖约 1990 s（求解时限内）。 */
     private static ShipTrackSnapshot movingSnapshot() {
-        long now = System.currentTimeMillis();
+        long now = System.currentTimeMillis() - 1_000L;
         double mpl = mPerDegLon(LAT0);
         List<ShipPoint> points = new ArrayList<>(200);
         for (int i = 0; i < 200; i++) {
@@ -221,16 +252,13 @@ class RendezvousCoordinatorTest {
     }
 
     /** 门面板：按 solvable 返回有解／无解（M3 是普通类，故用继承覆盖，不引入 mock 框架） */
-    private static final class StubbedFacade extends RendezvousFacade {
+    private static final class StubbedFacade implements RendezvousPort {
 
         private final boolean solvable;
 
         private RendezvousCommand lastCommand;
 
         private StubbedFacade(boolean solvable) {
-            // 门面构造器会对两个端口做 requireNonNull，故此处给占位实现；
-            // 本桩已覆盖 solve()，这两个端口在测试中不会被调用。
-            super(mmsi -> null, id -> null);
             this.solvable = solvable;
         }
 

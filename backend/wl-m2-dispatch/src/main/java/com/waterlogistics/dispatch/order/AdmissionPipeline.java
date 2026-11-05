@@ -1,7 +1,9 @@
 package com.waterlogistics.dispatch.order;
 
+import com.waterlogistics.algo.estimation.DeliveryDeadline;
 import com.waterlogistics.algo.estimation.EtaLowerBound;
 import com.waterlogistics.algo.estimation.EstimatedPoint;
+import com.waterlogistics.algo.estimation.OrderEta;
 import com.waterlogistics.algo.estimation.ServiceSegmentGate;
 import com.waterlogistics.algo.estimation.WaterwayGeometry;
 import java.util.ArrayList;
@@ -11,8 +13,9 @@ import java.util.Set;
 /**
  * 接单受理判定流水线（M2 · 卢肄文 · 功能 1 · {@code 80-A组算法方案} §3.1.2）。
  *
- * <p>把 {@code 80} §3.1.2 的八步判定链完整落到可执行代码：信息完整性 → 幂等与重复 → 时效性
- * （{@code etaMin}）→ 货物合法性 → 数据有效性 → 空间闸门（{@code tEnter}）→ 状态闸门 → 时间闸门。
+ * <p>把 {@code 80} §3.1.2 的八步判定链完整落到可执行代码：信息完整性 → 幂等与重复 →
+ * 数据有效性（MEDIUM.25：提到时效闸之前，坏数据上不算时间可行性）→ 时效性
+ * （{@code etaMin}）→ 货物合法性 → 空间闸门（{@code tEnter}）→ 状态闸门 → 时间闸门。
  *
  * <h3>★ 三处「先空着」的判定，以及为什么空着不等于放过</h3>
  * <p>有几步依赖<b>系统里还不存在的数据</b>，本类不臆造、也不用默认值糊过去，而是把对应输入声明为
@@ -139,18 +142,45 @@ public final class AdmissionPipeline {
      * @param deadlineMs    期望送达时刻，Unix 毫秒；{@code null} 表示未填
      * @param priority      优先级编码；{@code null} 表示未填
      * @param goodsId       货物单号（查就绪状态用）
+     * @param cargoNestId   货物所在巢；{@code null} 表示由客户端未指定、取离船最近的巢
      */
     public record OrderRequest(String orderId, String mmsi, String cargoType, Double goodsWeightKg,
-            Long deadlineMs, String priority, String goodsId) {
+            Long deadlineMs, String priority, String goodsId, String cargoNestId) {
 
-        /** 信息是否完整（§3.1.2 ①）。{@code priority} 与 {@code deadline} 缺一即转人工。 */
+        /**
+         * 兼容 11-05 之前的 7 参构造（不带货巢）。
+         *
+         * @param orderId       订单号
+         * @param mmsi          船舶 MMSI
+         * @param cargoType     货物类型
+         * @param goodsWeightKg 物资载重，kg
+         * @param deadlineMs    期望送达时刻，Unix 毫秒
+         * @param priority      优先级编码
+         * @param goodsId       货物单号
+         */
+        public OrderRequest(String orderId, String mmsi, String cargoType, Double goodsWeightKg,
+                Long deadlineMs, String priority, String goodsId) {
+            this(orderId, mmsi, cargoType, goodsWeightKg, deadlineMs, priority, goodsId, null);
+        }
+
+        /**
+         * 信息是否完整（§3.1.2 ①）。{@code priority} 缺即转人工。
+         *
+         * <p><b>{@code deadlineMs} 不参与本判据（11-05 序号 2 起）</b>：截止时刻改由系统算
+         * （{@link DeliveryDeadline}：船驶出服务航段与最大配送时限取小），客户端不填是正常输入。
+         * 此前的版本要求它非空，而前端下单页早已删掉「期望送达时间」字段——两者叠加的结果是
+         * <b>每一笔正常下单都判 {@code INCOMPLETE} 转人工</b>，主链走不通。
+         *
+         * <p><b>{@code goodsId}／{@code cargoNestId} 不参与本判据</b>：两者都是「可选精化」——
+         * 货单号空＝按订单号查货，货巢空＝取离船最近的巢，都有确定的下游口径。
+         * 把可空字段塞进完整性判据，只会让正常下单被判成「转人工」。
+         */
         public boolean isComplete() {
             return orderId != null && !orderId.isBlank()
                     && mmsi != null && !mmsi.isBlank()
                     && cargoType != null && !cargoType.isBlank()
                     && goodsWeightKg != null && goodsWeightKg > 0.0
                     && Double.isFinite(goodsWeightKg)
-                    && deadlineMs != null
                     && priority != null && !priority.isBlank();
         }
     }
@@ -158,11 +188,17 @@ public final class AdmissionPipeline {
     /**
      * 船舶状态观测（由步骤 C／F 的估计结果给出）。
      *
-     * @param currentS    当前沿航道弧长估计，m
+     * @param currentS    当前沿航道弧长估计，m（投影垂足已夹到折线内，任何船位都落在
+     *                    {@code [0, 全长]}，因此<b>不能</b>拿它单独判段内外）
      * @param lastAisTsMs 最近一次有效 AIS 的时刻，Unix 毫秒
      * @param dataQuality 数据质量编码（{@code OK}／{@code EXTRAPOLATED}／{@code INSUFFICIENT}）
+     * @param inSegment   船是否已在服务航段走廊内——由装配器按「弧长落在
+     *                    {@code [startS, endS]} 且横向垂距 ≤ 走廊半宽」判定。
+     *                    判据归属装配器的原因：投影弧长经垂足夹取后恒在折线内，
+     *                    只看弧长会把横向偏离几公里的船误判成「在段内」
      */
-    public record ShipObservation(double currentS, long lastAisTsMs, String dataQuality) {
+    public record ShipObservation(double currentS, long lastAisTsMs, String dataQuality,
+            boolean inSegment) {
     }
 
     /**
@@ -242,26 +278,67 @@ public final class AdmissionPipeline {
      * @param horizonSec        预测时域，s
      * @param weightTolKg       重复单重量容差，kg
      * @param dupWindowSec      重复单时间窗，s
+     * @param maxDeliverySec    最大配送时限，s（系统 deadline 的业务上限；11-05 序号 2 新增）
      */
     public record Policy(Set<String> cargoWhitelist, double maxPayloadAllTypesKg,
             double maxPayloadMargin, long ttlAisMs, double vMaxCruiseMs, double tHandoverMinSec,
             long wakeMarginSec, long suspendRetrySec, long horizonSec, double weightTolKg,
-            long dupWindowSec) {
+            long dupWindowSec, long maxDeliverySec) {
+
+        /**
+         * 兼容 11-05 序号 2 之前的 11 参构造：最大配送时限取与 {@code horizonSec} 同值。
+         *
+         * <p>为什么取 {@code horizonSec} 而不是别的常数：两者都是「系统只对一个预测时域内的
+         * 承诺负责」的同一条约束的不同表述，取同值不会引入新的量纲问题；且既有单测传的是
+         * 11 参，行为保持可预期（1800 s 时两者相等）。
+         *
+         * @param cargoWhitelist       货物类型白名单
+         * @param maxPayloadAllTypesKg 全机型载重上界，kg
+         * @param maxPayloadMargin     载重上界裕度
+         * @param ttlAisMs             订单数据新鲜度 TTL，ms
+         * @param vMaxCruiseMs         最大巡航速度，m/s
+         * @param tHandoverMinSec      交接时长下界，s
+         * @param wakeMarginSec        提前唤醒余量，s
+         * @param suspendRetrySec      暂缓重试周期，s
+         * @param horizonSec           预测时域，s
+         * @param weightTolKg          重复单重量容差，kg
+         * @param dupWindowSec         重复单时间窗，s
+         */
+        public Policy(Set<String> cargoWhitelist, double maxPayloadAllTypesKg,
+                double maxPayloadMargin, long ttlAisMs, double vMaxCruiseMs, double tHandoverMinSec,
+                long wakeMarginSec, long suspendRetrySec, long horizonSec, double weightTolKg,
+                long dupWindowSec) {
+            this(cargoWhitelist, maxPayloadAllTypesKg, maxPayloadMargin, ttlAisMs, vMaxCruiseMs,
+                    tHandoverMinSec, wakeMarginSec, suspendRetrySec, horizonSec, weightTolKg,
+                    dupWindowSec, horizonSec);
+        }
 
         public Policy {
             cargoWhitelist = cargoWhitelist == null ? Set.of() : Set.copyOf(cargoWhitelist);
-            if (!(maxPayloadAllTypesKg > 0.0)) {
-                throw new IllegalArgumentException("载重上界必须为正：" + maxPayloadAllTypesKg);
+            // 有限性一并卡（HIGH.15）：NaN 过所有比较运算，若不在这里拒，
+            // payloadLimit 会算成 NaN，后续「载重 > NaN」恒 false，超载单被静默放行
+            if (!Double.isFinite(maxPayloadAllTypesKg) || !(maxPayloadAllTypesKg > 0.0)) {
+                throw new IllegalArgumentException("载重上界必须为正的有限值：" + maxPayloadAllTypesKg);
             }
-            if (maxPayloadMargin < 0.0 || maxPayloadMargin >= 1.0) {
-                throw new IllegalArgumentException("载重裕度须在 [0,1) 内：" + maxPayloadMargin);
+            if (!Double.isFinite(maxPayloadMargin) || maxPayloadMargin < 0.0
+                    || maxPayloadMargin >= 1.0) {
+                throw new IllegalArgumentException("载重裕度须在 [0,1) 内的有限值：" + maxPayloadMargin);
             }
-            if (!(ttlAisMs > 0) || !(vMaxCruiseMs > 0.0) || tHandoverMinSec < 0.0) {
-                throw new IllegalArgumentException("TTL / 巡航速度必须为正");
+            if (!Double.isFinite(ttlAisMs) || !(ttlAisMs > 0)
+                    || !Double.isFinite(vMaxCruiseMs) || !(vMaxCruiseMs > 0.0)
+                    || !Double.isFinite(tHandoverMinSec) || tHandoverMinSec < 0.0) {
+                throw new IllegalArgumentException("TTL / 巡航速度必须为正的有限值");
+            }
+            if (!Double.isFinite(weightTolKg) || weightTolKg < 0.0) {
+                throw new IllegalArgumentException("重复单重量容差须为非负有限值：" + weightTolKg);
             }
             if (wakeMarginSec < 0 || suspendRetrySec <= 0 || horizonSec <= 0
-                    || weightTolKg < 0.0 || dupWindowSec <= 0) {
-                throw new IllegalArgumentException("唤醒／重试／时域／容差参数非法");
+                    || dupWindowSec <= 0) {
+                throw new IllegalArgumentException("唤醒／重试／时域参数非法");
+            }
+            if (maxDeliverySec <= 0 || maxDeliverySec > 86_400L) {
+                throw new IllegalArgumentException(
+                        "最大配送时限须在 (0, 86400] 秒内，实际 " + maxDeliverySec);
             }
         }
     }
@@ -306,12 +383,38 @@ public final class AdmissionPipeline {
      * @param etaLowerBoundSec 时间可行性下界 {@code etaMin}，s（未算出时为 {@code NaN}）
      * @param enterTsMs       驶入服务航段时刻，Unix 毫秒（未算出时为 {@code null}）
      * @param detail          人读说明
+     * @param deadlineMs      系统送达截止时刻，Unix 毫秒；未算出处为 {@code null}。
+     *                        取值＝{@code min(客户端期望, 船驶出服务航段时刻, 下单+最大配送时限)}，
+     *                        由 {@link DeliveryDeadline} 给出，落 {@code order_task.expected_time}
+     * @param etaTsMs         预计送达时刻，Unix 毫秒；未算出时为 {@code null}。
+     *                        未派单阶段取 {@code 下单时刻 + etaMin}（偏早的下界），
+     *                        派发后由飞行阶段推进重算（{@link OrderEta}）
      */
     public record Decision(Outcome outcome, Reason reason, long wakeAtMs, WakeEvent wakeEvent,
-            List<String> skippedCriteria, double etaLowerBoundSec, Long enterTsMs, String detail) {
+            List<String> skippedCriteria, double etaLowerBoundSec, Long enterTsMs, String detail,
+            Long deadlineMs, Long etaTsMs) {
 
         public Decision {
             skippedCriteria = List.copyOf(skippedCriteria);
+        }
+
+        /**
+         * 兼容 11-05 序号 2 之前的 8 参构造：截止时刻与预计送达均未算出。
+         *
+         * @param outcome          出口类型
+         * @param reason           原因码
+         * @param wakeAtMs         唤醒时刻，Unix 毫秒
+         * @param wakeEvent        唤醒事件
+         * @param skippedCriteria  本次未判定的判据名
+         * @param etaLowerBoundSec 时间可行性下界，s
+         * @param enterTsMs        驶入服务航段时刻，Unix 毫秒
+         * @param detail           人读说明
+         */
+        public Decision(Outcome outcome, Reason reason, long wakeAtMs, WakeEvent wakeEvent,
+                List<String> skippedCriteria, double etaLowerBoundSec, Long enterTsMs,
+                String detail) {
+            this(outcome, reason, wakeAtMs, wakeEvent, skippedCriteria, etaLowerBoundSec,
+                    enterTsMs, detail, null, null);
         }
 
         /** 是否放行进入调度。 */
@@ -364,15 +467,38 @@ public final class AdmissionPipeline {
                     Double.NaN, null, "MMSI 非 9 位数字：" + request.mmsi());
         }
 
+        // 系统 deadline 在信息完整性之后即算出：后续每一处出口都要带上它，
+        // 否则「延后待唤醒」「重复单」这些单子落库时 expected_time 是 NULL，
+        // 而 deadline 是每笔订单都该有的硬边界（不依赖 etaMin，也不依赖船位是否新鲜）。
+        Long deadlineMs = systemDeadline(input, policy, nowMs);
+
         // ② 幂等与重复（幂等落库由调用方负责；这里只判「重复单」）
         if (input.priorOrders() == null) {
             skipped.add(CRITERION_DUPLICATE);
         } else if (isDuplicate(request, input.priorOrders(), policy, nowMs)) {
             return new Decision(Outcome.REJECT, Reason.DUPLICATE, 0L, WakeEvent.NONE, skipped,
-                    Double.NaN, null, "窗口内存在同船、同货类、同重量的非终止订单");
+                    Double.NaN, null, "窗口内存在同船、同货类、同重量的非终止订单", deadlineMs, null);
         }
 
-        // ③ 时效性：先算 etaMin（需要快照 ＋ 机巢），再用它卡截止时刻
+        // ③ 数据有效性（MEDIUM.25：提到时效闸之前）——船位缺失或过期时，etaMin 与
+        //    空间闸门都是建立在坏数据上的判定，先延后等数据恢复，不拿坏数算时间可行性
+        if (input.ship() == null || nowMs - input.ship().lastAisTsMs() > policy.ttlAisMs()) {
+            return new Decision(Outcome.DEFER, Reason.DATA_STALE,
+                    nowMs + policy.suspendRetrySec() * 1000L, WakeEvent.DATA_RESTORED, skipped, Double.NaN,
+                    null, "船舶状态缺失或已超 TTL，按 suspendRetrySec 重判", deadlineMs, null);
+        }
+        if (input.connectorAlive() == null) {
+            skipped.add(CRITERION_CONNECTOR_HEALTH);
+        } else if (!input.connectorAlive()) {
+            return new Decision(Outcome.DEFER, Reason.DATA_STALE,
+                    nowMs + policy.suspendRetrySec() * 1000L, WakeEvent.DATA_RESTORED, skipped, Double.NaN,
+                    null, "采集链路断流，按 suspendRetrySec 重判", deadlineMs, null);
+        }
+
+        // ④ 时效性：先算 etaMin（系统 deadline 已在上方算出），再用两者卡截止时刻。
+        //    客户端若仍填期望送达时间，按更早者取——那是用户给自己定的更严约束，
+        //    不覆盖系统算出的硬边界。
+        Long etaTsMs = null;
         double etaMin = Double.NaN;
         if (input.snapshot() == null || input.snapshot().points().isEmpty()) {
             skipped.add(CRITERION_ETA_MIN);
@@ -382,75 +508,72 @@ public final class AdmissionPipeline {
             EtaLowerBound.Result eta = EtaLowerBound.compute(input.snapshot().points(),
                     toNestPositions(input.nests()), policy.vMaxCruiseMs(), policy.tHandoverMinSec());
             etaMin = eta.etaLowerBoundSec();
+            etaTsMs = OrderEta.beforeDispatch(nowMs, etaMin);
         }
-        if (nowMs >= request.deadlineMs()) {
+        if (nowMs >= deadlineMs) {
             return new Decision(Outcome.REJECT, Reason.EXPIRED, 0L, WakeEvent.NONE, skipped, etaMin,
-                    null, "已过截止时刻");
+                    null, "已过截止时刻 " + deadlineMs, deadlineMs, etaTsMs);
         }
-        if (!Double.isNaN(etaMin) && request.deadlineMs() - nowMs < etaMin * 1000.0) {
+        if (!Double.isNaN(etaMin) && deadlineMs - nowMs < etaMin * 1000.0) {
             return new Decision(Outcome.REJECT, Reason.TIME_INFEASIBLE, 0L, WakeEvent.NONE, skipped,
                     etaMin, null, String.format("剩余时间 %.0f s 小于最短任务时长下界 %.0f s",
-                            (request.deadlineMs() - nowMs) / 1000.0, etaMin));
+                            (deadlineMs - nowMs) / 1000.0, etaMin), deadlineMs, etaTsMs);
         }
 
-        // ④ 货物合法性
+        // ⑤ 货物合法性
         if (!policy.cargoWhitelist().contains(request.cargoType())) {
             return new Decision(Outcome.REJECT, Reason.CARGO_TYPE, 0L, WakeEvent.NONE, skipped,
-                    etaMin, null, "货物类型不在白名单：" + request.cargoType());
+                    etaMin, null, "货物类型不在白名单：" + request.cargoType(), deadlineMs, etaTsMs);
         }
         double payloadLimit = policy.maxPayloadAllTypesKg() * (1.0 - policy.maxPayloadMargin());
-        if (request.goodsWeightKg() > payloadLimit) {
+        // isFinite 双保险（HIGH.15）：载重 NaN 时「> payloadLimit」恒 false，不拦就会静默放行
+        if (!Double.isFinite(request.goodsWeightKg()) || request.goodsWeightKg() > payloadLimit) {
             return new Decision(Outcome.REJECT, Reason.OVERLOAD, 0L, WakeEvent.NONE, skipped, etaMin,
-                    null, String.format("载重 %.1f kg 超过上界 %.1f kg", request.goodsWeightKg(),
-                            payloadLimit));
-        }
-
-        // ⑤ 数据有效性：状态存在 ＋ TTL ＋ 链路健康
-        if (input.ship() == null || nowMs - input.ship().lastAisTsMs() > policy.ttlAisMs()) {
-            return new Decision(Outcome.DEFER, Reason.DATA_STALE,
-                    nowMs + policy.suspendRetrySec() * 1000L, WakeEvent.DATA_RESTORED, skipped, etaMin,
-                    null, "船舶状态缺失或已超 TTL，按 suspendRetrySec 重判");
-        }
-        if (input.connectorAlive() == null) {
-            skipped.add(CRITERION_CONNECTOR_HEALTH);
-        } else if (!input.connectorAlive()) {
-            return new Decision(Outcome.DEFER, Reason.DATA_STALE,
-                    nowMs + policy.suspendRetrySec() * 1000L, WakeEvent.DATA_RESTORED, skipped, etaMin,
-                    null, "采集链路断流，按 suspendRetrySec 重判");
+                    null, String.format("载重 %.1f kg 超过上界 %.1f kg 或非有限值", request.goodsWeightKg(),
+                            payloadLimit), deadlineMs, etaTsMs);
         }
 
         // ⑥ 空间闸门
         Long enterTsMs = null;
-        if (input.serviceSegment() == null || input.snapshot() == null) {
+        // 空点列一并跳过（HIGH.16）：snapshot 对象存在但 points 为空时，
+        // firstEntry 无点可算，不能把「没有轨迹」当成「永远进不了段」去拒单
+        if (input.serviceSegment() == null || input.snapshot() == null
+                || input.snapshot().points().isEmpty()) {
             skipped.add(CRITERION_SPACE_GATE);
         } else {
             ServiceSegment segment = input.serviceSegment();
-            if (segment.contains(input.ship().currentS())) {
+            if (input.ship().inSegment()) {
                 enterTsMs = input.snapshot().t0Ms();      // 已在段内：驶入时刻即当前
             } else {
                 ServiceSegmentGate.EntryResult entry = ServiceSegmentGate.firstEntry(
                         input.snapshot().points(), segment.geometry(), segment.startS(),
                         segment.endS());
                 if (!entry.reaches()) {
-                    return new Decision(Outcome.REJECT, Reason.OUT_OF_SERVICE, 0L, WakeEvent.NONE,
-                            skipped, etaMin, null, "预测时域内船舶不会进入服务航段");
+                    // MEDIUM.27：预测时域内不会进段 ≠ 永远不进——船可能在时域外才进，
+                    // 或后续观测改变走向。判 OUT_OF_SERVICE 是永久拒单，把「还没到」
+                    // 误判成「到不了」；改为延后按 suspendRetrySec 周期重评
+                    return new Decision(Outcome.DEFER, Reason.SHIP_OUT_OF_SEGMENT,
+                            nowMs + policy.suspendRetrySec() * 1000L, WakeEvent.SHIP_ENTERED,
+                            skipped, etaMin, null,
+                            "预测时域内船舶不会进入服务航段，按 suspendRetrySec 周期重评",
+                            deadlineMs, etaTsMs);
                 }
                 enterTsMs = entry.enterTsMs();
                 // etaMin 没算出来时不得拿它去卡上界：NaN 转 long 会变 0，等于凭空放宽
                 long deadlineBound = Double.isNaN(etaMin)
-                        ? request.deadlineMs()
-                        : request.deadlineMs() - (long) (etaMin * 1000.0);
+                        ? deadlineMs
+                        : deadlineMs - (long) (etaMin * 1000.0);
                 long latest = Math.min(deadlineBound,
                         input.snapshot().t0Ms() + policy.horizonSec() * 1000L);
                 if (enterTsMs > latest) {
                     return new Decision(Outcome.REJECT, Reason.OUT_OF_SERVICE, 0L, WakeEvent.NONE,
                             skipped, etaMin, enterTsMs,
-                            "驶入时刻晚于「截止时刻 − etaMin」或预测时域上界");
+                            "驶入时刻晚于「截止时刻 − etaMin」或预测时域上界", deadlineMs, etaTsMs);
                 }
                 long wakeAt = enterTsMs - policy.wakeMarginSec() * 1000L;
                 return new Decision(Outcome.DEFER, Reason.SHIP_OUT_OF_SEGMENT, wakeAt,
                         WakeEvent.SHIP_ENTERED, skipped, etaMin, enterTsMs,
-                        "船尚未进入服务航段，按 tEnter − wakeMargin 定时唤醒");
+                        "船尚未进入服务航段，按 tEnter − wakeMargin 定时唤醒", deadlineMs, etaTsMs);
             }
         }
 
@@ -459,7 +582,8 @@ public final class AdmissionPipeline {
             skipped.add(CRITERION_GOODS_READY);
         } else if (!input.goodsReady()) {
             return new Decision(Outcome.DEFER, Reason.GOODS_NOT_READY, 0L, WakeEvent.GOODS_READY,
-                    skipped, etaMin, enterTsMs, "货物未就绪，等 GOODS_READY 事件唤醒");
+                    skipped, etaMin, enterTsMs, "货物未就绪，等 GOODS_READY 事件唤醒",
+                    deadlineMs, etaTsMs);
         }
 
         // ⑧ 时间闸门：熔断期间不拒单，只延后
@@ -467,11 +591,36 @@ public final class AdmissionPipeline {
             skipped.add(CRITERION_GATE_CUTOFF);
         } else if (input.gateCutoff()) {
             return new Decision(Outcome.DEFER, Reason.GATE_CUTOFF, 0L, WakeEvent.GATE_RESUME, skipped,
-                    etaMin, enterTsMs, "闸门熔断，等解除后恢复（熔断期间不拒单）");
+                    etaMin, enterTsMs, "闸门熔断，等解除后恢复（熔断期间不拒单）",
+                    deadlineMs, etaTsMs);
         }
 
         return new Decision(Outcome.ACCEPT_TRIGGER_SCHEDULE, Reason.NONE, 0L, WakeEvent.NONE, skipped,
-                etaMin, enterTsMs, "受理并触发调度");
+                etaMin, enterTsMs, "受理并触发调度", deadlineMs, etaTsMs);
+    }
+
+    /**
+     * 系统送达截止时刻：{@code min(客户端期望, 船驶出服务航段时刻, 下单 + 最大配送时限)}。
+     *
+     * <p><b>为什么不抛异常</b>：每一笔订单都要算这个值，缺预测、缺航段属于常态（新船、
+     * 数据断流、集中部署早期），算不出来时退化为「下单 + 最大配送时限」——
+     * 只会把时限放宽，不会凭空拒单。
+     *
+     * @param input  判定输入
+     * @param policy 判据参数
+     * @param nowMs  判定时刻，Unix 毫秒
+     * @return 系统 deadline，Unix 毫秒（恒非空）
+     */
+    static long systemDeadline(Input input, Policy policy, long nowMs) {
+        Long shipExitTsMs = null;
+        if (input.snapshot() != null && input.serviceSegment() != null) {
+            ServiceSegment segment = input.serviceSegment();
+            shipExitTsMs = DeliveryDeadline.shipExitTsMs(input.snapshot().points(),
+                    segment.geometry(), segment.startS(), segment.endS());
+        }
+        long systemTsMs = DeliveryDeadline.compute(nowMs, shipExitTsMs, policy.maxDeliverySec());
+        Long clientTsMs = input.request() == null ? null : input.request().deadlineMs();
+        return clientTsMs == null ? systemTsMs : Math.min(clientTsMs, systemTsMs);
     }
 
     // ───────────── 判据细节 ─────────────
@@ -514,7 +663,10 @@ public final class AdmissionPipeline {
             return false;
         }
         for (int i = 0; i < trimmed.length(); i++) {
-            if (!Character.isDigit(trimmed.charAt(i))) {
+            // MEDIUM.29：限 ASCII 数字。Character.isDigit 会放行全角数字
+            // （如 '４'）与其他文字系统数字，它们不是 MMSI 编码域
+            char c = trimmed.charAt(i);
+            if (c < '0' || c > '9') {
                 return false;
             }
         }

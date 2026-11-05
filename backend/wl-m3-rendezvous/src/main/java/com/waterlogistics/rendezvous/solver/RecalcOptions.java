@@ -1,5 +1,6 @@
 package com.waterlogistics.rendezvous.solver;
 
+import com.waterlogistics.algo.meeting.model.EpochMillis;
 import com.waterlogistics.algo.meeting.model.RendezvousSolveRequest;
 import com.waterlogistics.algo.meeting.model.Wind;
 
@@ -37,14 +38,18 @@ public record RecalcOptions(
 
     public RecalcOptions {
         Objects.requireNonNull(representativeWind, "representativeWind 不能为空");
-        if (deadlineMs <= 0L) {
-            throw new IllegalArgumentException("最晚会面时刻必须为正，实际 " + deadlineMs);
+        if (!EpochMillis.isValid(deadlineMs)) {
+            throw new IllegalArgumentException("最晚会面时刻须为合法的 Unix 毫秒值，实际 " + deadlineMs);
         }
-        if (meetWindowMarginSec < 0) {
-            throw new IllegalArgumentException("会面时间窗余量不能为负，实际 " + meetWindowMarginSec);
+        if (meetWindowMarginSec < 0 || meetWindowMarginSec > RendezvousSolveRequest.MAX_WINDOW_MARGIN_SEC) {
+            throw new IllegalArgumentException(
+                    "会面时间窗余量须在 [0, " + RendezvousSolveRequest.MAX_WINDOW_MARGIN_SEC
+                            + "] 秒内，实际 " + meetWindowMarginSec);
         }
-        if (!Double.isFinite(convergeEpsilonSec) || !(convergeEpsilonSec > (double) 0)) {
-            throw new IllegalArgumentException("收敛阈值必须为正的有限数，实际 " + convergeEpsilonSec);
+        if (!Double.isFinite(convergeEpsilonSec) || convergeEpsilonSec <= 0.0
+                || convergeEpsilonSec > RendezvousSolveRequest.MAX_CONVERGE_EPSILON_SEC) {
+            throw new IllegalArgumentException("收敛阈值须在 (0, "
+                                                       + RendezvousSolveRequest.MAX_CONVERGE_EPSILON_SEC + "] 秒内，实际 " + convergeEpsilonSec);
         }
         if (maxIterations <= 0 || maxIterations > RendezvousSolveRequest.MAX_ITERATIONS) {
             throw new IllegalArgumentException(
