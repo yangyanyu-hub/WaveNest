@@ -55,8 +55,8 @@ class AdmissionPipelineTest {
                 "ORD-1", "413800001", "MEDICINE", 10.0, DEADLINE_MS, "NORMAL", "G-1");
     }
 
-    private static AdmissionPipeline.ShipObservation ship(double currentS) {
-        return new AdmissionPipeline.ShipObservation(currentS, NOW_MS - 5_000L, "OK");
+    private static AdmissionPipeline.ShipObservation shipAt(double currentS, boolean inSegment) {
+        return new AdmissionPipeline.ShipObservation(currentS, NOW_MS - 5_000L, "OK", inSegment);
     }
 
     /** 从 {@code s0} 起以 2 m/s 前进的 31 点预测（每 60 s 一点，覆盖 1800 s）。 */
@@ -80,7 +80,7 @@ class AdmissionPipelineTest {
 
     /** 「全面接通」的输入：所有数据源都在，船在段内。 */
     private static AdmissionPipeline.Input completeInput() {
-        return new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0), snapshotFrom(5000.0),
+        return new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0),
                 nests(), segment(), Boolean.TRUE, Boolean.FALSE, List.of(), Boolean.TRUE, policy());
     }
 
@@ -94,16 +94,18 @@ class AdmissionPipelineTest {
         assertTrue(decision.allowsSchedule());
         assertFalse(decision.hasSkippedCriteria());
         assertTrue(decision.etaLowerBoundSec() > 0.0);
-        assertEquals(NOW_MS, decision.enterTsMs(), "已在段内时驶入时刻即快照起点");
+        assertEquals(NOW_MS - 5_000L, decision.enterTsMs(),
+                "已在段内时取「已可证在段内的最早时刻」＝快照 t0 与最近有效观测取小，"
+                        + "再以判定时刻为上界（MED-BUG.26）");
     }
 
     @Test
-    @DisplayName("① 信息不完整 → 转人工 INCOMPLETE（不流转）")
+    @DisplayName("① 信息不完整（缺载重） → 转人工 INCOMPLETE（不流转）")
     void incompleteRequest_shouldGoManual() {
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(
-                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0, null,
-                        "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", null,
+                        DEADLINE_MS, "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
         AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
@@ -113,12 +115,56 @@ class AdmissionPipelineTest {
     }
 
     @Test
+    @DisplayName("★ ① 不填期望送达时间 → 仍然受理（11-05 序号 2：deadline 改由系统算）")
+    void missingClientDeadline_shouldStillAccept() {
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0, null,
+                        "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                Boolean.FALSE, List.of(), Boolean.TRUE, policy());
+
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
+
+        assertEquals(AdmissionPipeline.Outcome.ACCEPT_TRIGGER_SCHEDULE, decision.outcome(),
+                "客户端不填期望时间不是「信息不完整」，此前这里会全部转人工");
+        assertEquals(AdmissionPipeline.Reason.NONE, decision.reason());
+    }
+
+    @Test
+    @DisplayName("★ ④ 系统 deadline＝min(船驶出航段, 下单+1800 s)；不填客户端值时取系统值")
+    void systemDeadline_shouldBeApplied() {
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0, null,
+                        "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                Boolean.FALSE, List.of(), Boolean.TRUE, policy()));
+
+        // 夹具里船 2 m/s 从 5000 m 走到段末 8000 m：1500 s 后驶出，早于业务上限 1800 s
+        assertEquals(NOW_MS + 1_500_000L, decision.deadlineMs(),
+                "船驶出航段时刻（1500 s）早于最大配送时限（1800 s），取前者");
+        assertTrue(decision.etaTsMs() != null && decision.etaTsMs() > NOW_MS,
+                "未派单阶段的预计送达时刻由 etaMin 换算，应已算出");
+    }
+
+    @Test
+    @DisplayName("★ ④ 客户端值更早时取客户端值（用户给自己定的更严约束不被系统覆盖）")
+    void earlierClientDeadline_shouldWin() {
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0,
+                        NOW_MS + 600_000L, "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                Boolean.FALSE, List.of(), Boolean.TRUE, policy()));
+
+        assertEquals(NOW_MS + 600_000L, decision.deadlineMs());
+    }
+
+    @Test
     @DisplayName("MMSI 非 9 位数字 → REJECT(MMSI_INVALID)")
     void invalidMmsi_shouldReject() {
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "4138A0001", "MEDICINE", 10.0,
                         DEADLINE_MS, "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
         assertEquals(AdmissionPipeline.Reason.MMSI_INVALID, AdmissionPipeline.admit(input).reason());
@@ -132,7 +178,7 @@ class AdmissionPipelineTest {
     void duplicateOrder_shouldReject() {
         AdmissionPipeline.PriorOrder duplicate = new AdmissionPipeline.PriorOrder(
                 "413800001", "MEDICINE", 12.0, NOW_MS - 60_000L, false);
-        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE,
                 List.of(duplicate), Boolean.TRUE, policy());
 
@@ -141,7 +187,7 @@ class AdmissionPipelineTest {
         // 终止态不参与重复判定
         AdmissionPipeline.PriorOrder terminal = new AdmissionPipeline.PriorOrder(
                 "413800001", "MEDICINE", 12.0, NOW_MS - 60_000L, true);
-        AdmissionPipeline.Input accepted = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input accepted = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE,
                 List.of(terminal), Boolean.TRUE, policy());
         assertTrue(AdmissionPipeline.admit(accepted).allowsSchedule());
@@ -150,7 +196,7 @@ class AdmissionPipelineTest {
         AdmissionPipeline.PriorOrder heavy = new AdmissionPipeline.PriorOrder(
                 "413800001", "MEDICINE", 30.0, NOW_MS - 60_000L, false);
         AdmissionPipeline.Input notDuplicate = new AdmissionPipeline.Input(request(), NOW_MS,
-                ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE,
+                shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE,
                 List.of(heavy), Boolean.TRUE, policy());
         assertTrue(AdmissionPipeline.admit(notDuplicate).allowsSchedule());
     }
@@ -161,7 +207,7 @@ class AdmissionPipelineTest {
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0,
                         NOW_MS - 1L, "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
         assertEquals(AdmissionPipeline.Reason.EXPIRED, AdmissionPipeline.admit(input).reason());
@@ -174,7 +220,7 @@ class AdmissionPipelineTest {
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0,
                         NOW_MS + 60_000L, "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
         AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
@@ -188,7 +234,7 @@ class AdmissionPipelineTest {
         AdmissionPipeline.Input wrongType = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "BULK", 10.0, DEADLINE_MS,
                         "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
         assertEquals(AdmissionPipeline.Reason.CARGO_TYPE, AdmissionPipeline.admit(wrongType).reason());
 
@@ -196,16 +242,66 @@ class AdmissionPipelineTest {
         AdmissionPipeline.Input overload = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 24.0,
                         DEADLINE_MS, "NORMAL", "G-1"),
-                NOW_MS, ship(5000.0), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
         assertEquals(AdmissionPipeline.Reason.OVERLOAD, AdmissionPipeline.admit(overload).reason());
+    }
+
+    @Test
+    @DisplayName("船舶数据缺失时，非法配送品类仍被拒绝，不再被延后受理")
+    void staleData_withIllegalCargoType_shouldRejectBeforeDefer() {
+        AdmissionPipeline.ShipObservation stale = new AdmissionPipeline.ShipObservation(
+                5000.0, NOW_MS - 200_000L, "INSUFFICIENT", true);
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "BULK", 10.0,
+                        DEADLINE_MS, "NORMAL", "G-1"),
+                NOW_MS, stale, snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE,
+                Boolean.FALSE, List.of(), Boolean.TRUE, policy());
+
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
+
+        assertEquals(AdmissionPipeline.Outcome.REJECT, decision.outcome());
+        assertEquals(AdmissionPipeline.Reason.CARGO_TYPE, decision.reason());
+    }
+
+    @Test
+    @DisplayName("采集链路断流时，非法配送品类仍被拒绝，不再被延后受理")
+    void connectorDown_withIllegalCargoType_shouldRejectBeforeDefer() {
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "BULK", 10.0,
+                        DEADLINE_MS, "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(),
+                Boolean.FALSE, Boolean.FALSE, List.of(), Boolean.TRUE, policy());
+
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
+
+        assertEquals(AdmissionPipeline.Outcome.REJECT, decision.outcome());
+        assertEquals(AdmissionPipeline.Reason.CARGO_TYPE, decision.reason());
+    }
+
+    @Test
+    @DisplayName("拒单文案给出当前可选品类范围，不展示内部术语")
+    void cargoTypeReject_shouldListEffectiveOptions() {
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(
+                new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "BULK", 10.0,
+                        DEADLINE_MS, "NORMAL", "G-1"),
+                NOW_MS, shipAt(5000.0, true), snapshotFrom(5000.0), nests(), segment(),
+                Boolean.TRUE, Boolean.FALSE, List.of(), Boolean.TRUE, policy());
+
+        String detail = AdmissionPipeline.admit(input).detail();
+
+        assertTrue(detail.contains("当前不支持配送该品类"));
+        assertFalse(detail.contains("白名单"));
+        for (String option : policy().cargoWhitelist()) {
+            assertTrue(detail.contains(option), "可选品类应来自当前生效集合：" + option);
+        }
     }
 
     @Test
     @DisplayName("⑤ 状态缺失或超 TTL → DEFER(DATA_STALE)，唤醒事件 DATA_RESTORED")
     void staleData_shouldDefer() {
         AdmissionPipeline.ShipObservation stale = new AdmissionPipeline.ShipObservation(
-                5000.0, NOW_MS - 200_000L, "INSUFFICIENT");
+                5000.0, NOW_MS - 200_000L, "INSUFFICIENT", true);
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, stale,
                 snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE, List.of(),
                 Boolean.TRUE, policy());
@@ -217,7 +313,7 @@ class AdmissionPipelineTest {
         assertEquals(NOW_MS + 60_000L, decision.wakeAtMs(), "按 suspendRetrySec 重判");
 
         // 链路断流同样按数据不足延后
-        AdmissionPipeline.Input linkDown = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input linkDown = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE, List.of(),
                 Boolean.FALSE, policy());
         assertEquals(AdmissionPipeline.Reason.DATA_STALE, AdmissionPipeline.admit(linkDown).reason());
@@ -227,7 +323,7 @@ class AdmissionPipelineTest {
     @DisplayName("⑥ 船在段外但会驶入 → DEFER(SHIP_OUT_OF_SEGMENT)，唤醒时刻 = tEnter − wakeMargin")
     void shipWillEnter_shouldDeferUntilEnter() {
         // 起点 s=0，2 m/s → 2000 m 处需 1000 s；唤醒应在 1000 − 120 = 880 s 后
-        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, ship(0.0),
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(0.0, false),
                 snapshotFrom(0.0), nests(), segment(), Boolean.TRUE, Boolean.FALSE, List.of(),
                 Boolean.TRUE, policy());
 
@@ -240,8 +336,8 @@ class AdmissionPipelineTest {
     }
 
     @Test
-    @DisplayName("⑥ 预测时域内永不进段 → REJECT(OUT_OF_SERVICE)（这是拒单而非延后）")
-    void neverEntersSegment_shouldReject() {
+    @DisplayName("⑥ 预测时域内永不进段 → DEFER(SHIP_OUT_OF_SEGMENT) 周期重评（MEDIUM.27：不永久拒单）")
+    void neverEntersSegment_shouldDeferWithRetry() {
         // 反向行驶：s 递减，永远进不了 [2000, 8000]
         List<EstimatedPoint> points = new ArrayList<>();
         for (int i = 0; i <= 30; i++) {
@@ -249,11 +345,15 @@ class AdmissionPipelineTest {
             points.add(new EstimatedPoint(NOW_MS + i * 60_000L, LON,
                     BASE_LAT + Math.max(0.0, s) / MPD_LAT, 20.0, 15.0));
         }
-        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, ship(1000.0),
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(1000.0, false),
                 new AdmissionPipeline.SnapshotView(NOW_MS, points), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
-        assertEquals(AdmissionPipeline.Reason.OUT_OF_SERVICE, AdmissionPipeline.admit(input).reason());
+        // MEDIUM.27：「时域内进不了段」≠「永远进不了」——延后重评而非 OUT_OF_SERVICE 永久拒单
+        AdmissionPipeline.Decision decision = AdmissionPipeline.admit(input);
+        assertEquals(AdmissionPipeline.Outcome.DEFER, decision.outcome());
+        assertEquals(AdmissionPipeline.Reason.SHIP_OUT_OF_SEGMENT, decision.reason());
+        assertEquals(NOW_MS + 60_000L, decision.wakeAtMs(), "按 suspendRetrySec 周期重评");
     }
 
     @Test
@@ -263,7 +363,7 @@ class AdmissionPipelineTest {
         AdmissionPipeline.Input input = new AdmissionPipeline.Input(
                 new AdmissionPipeline.OrderRequest("ORD-1", "413800001", "MEDICINE", 10.0,
                         NOW_MS + 600_000L, "NORMAL", "G-1"),
-                NOW_MS, ship(0.0), snapshotFrom(0.0), nests(), segment(), Boolean.TRUE,
+                NOW_MS, shipAt(0.0, false), snapshotFrom(0.0), nests(), segment(), Boolean.TRUE,
                 Boolean.FALSE, List.of(), Boolean.TRUE, policy());
 
         assertEquals(AdmissionPipeline.Reason.OUT_OF_SERVICE, AdmissionPipeline.admit(input).reason());
@@ -272,7 +372,7 @@ class AdmissionPipelineTest {
     @Test
     @DisplayName("⑦ 货未就绪 → DEFER(GOODS_NOT_READY)，等 GOODS_READY 事件")
     void goodsNotReady_shouldDefer() {
-        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 snapshotFrom(5000.0), nests(), segment(), Boolean.FALSE, Boolean.FALSE, List.of(),
                 Boolean.TRUE, policy());
 
@@ -285,7 +385,7 @@ class AdmissionPipelineTest {
     @Test
     @DisplayName("⑧ 闸门熔断 → DEFER(GATE_CUTOFF)，绝不拒单")
     void gateCutoff_shouldDeferNotReject() {
-        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input input = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 snapshotFrom(5000.0), nests(), segment(), Boolean.TRUE, Boolean.TRUE, List.of(),
                 Boolean.TRUE, policy());
 
@@ -300,7 +400,7 @@ class AdmissionPipelineTest {
     @DisplayName("★ 数据源未接通：判据记入 skipped，不静默放过")
     void missingDataSources_shouldBeReportedAsSkipped() {
         // 只有订单与船状态，航道台账／机巢／货况／闸门全没有
-        AdmissionPipeline.Input bare = new AdmissionPipeline.Input(request(), NOW_MS, ship(5000.0),
+        AdmissionPipeline.Input bare = new AdmissionPipeline.Input(request(), NOW_MS, shipAt(5000.0, true),
                 null, List.of(), null, null, null, null, null, policy());
 
         AdmissionPipeline.Decision decision = AdmissionPipeline.admit(bare);
@@ -322,7 +422,7 @@ class AdmissionPipelineTest {
     }
 
     @Test
-    @DisplayName("参数与输入校验")
+    @DisplayName("参数与输入校验（含 HIGH.15：NaN 过所有比较运算，必须被有限性检查拦住）")
     void validation_shouldRejectBadArguments() {
         assertThrows(IllegalArgumentException.class,
                 () -> new AdmissionPipeline.ServiceSegment(NORTH, 8000.0, 2000.0));
@@ -332,5 +432,81 @@ class AdmissionPipelineTest {
         assertThrows(IllegalArgumentException.class,
                 () -> new AdmissionPipeline.Policy(Set.of("MEDICINE"), 25.0, 1.0, 120_000L, 20.0,
                         120.0, 120L, 60L, 1800L, 5.0, 600L));
+        // HIGH.15：NaN 会通过所有「< / > / >=」比较，载荷上界算出 NaN 后
+        // 「载重 > NaN」恒 false → 超载单静默放行。有限性检查必须在这里兜住
+        assertThrows(IllegalArgumentException.class,
+                () -> new AdmissionPipeline.Policy(Set.of("MEDICINE"), 25.0, Double.NaN, 120_000L,
+                        20.0, 120.0, 120L, 60L, 1800L, 5.0, 600L), "裕度 NaN");
+        assertThrows(IllegalArgumentException.class,
+                () -> new AdmissionPipeline.Policy(Set.of("MEDICINE"), Double.NaN, 0.05, 120_000L,
+                        20.0, 120.0, 120L, 60L, 1800L, 5.0, 600L), "载重上界 NaN");
+        assertThrows(IllegalArgumentException.class,
+                () -> new AdmissionPipeline.Policy(Set.of("MEDICINE"), 25.0, 0.05, 120_000L, 20.0,
+                        120.0, 120L, 60L, 1800L, Double.NaN, 600L), "重复单容差 NaN");
+        // MEDIUM.29：MMSI 只认 ASCII 0-9，全角数字与其他文字系统数字不放行
+        assertFalse(AdmissionPipeline.isValidMmsi("４１３８００００１"), "全角数字");
+        assertFalse(AdmissionPipeline.isValidMmsi("4138๐๐๐๐๑"), "非 ASCII 数字字符");
+    }
+
+    // ───────── 重复单判据：同船 ＋ 同货型 ＋ 同货巢 ＋ 时间窗 ─────────
+
+    /** 带货物所在巢的下单请求（其余字段同 {@link #request()}）。 */
+    private static AdmissionPipeline.OrderRequest requestAt(String mmsi, String cargoNestId) {
+        return new AdmissionPipeline.OrderRequest(
+                "ORD-1", mmsi, "MEDICINE", 10.0, DEADLINE_MS, "NORMAL", "G-1", cargoNestId);
+    }
+
+    private static boolean duplicate(AdmissionPipeline.OrderRequest request,
+            String priorMmsi, String priorNestId) {
+        AdmissionPipeline.PriorOrder prior = new AdmissionPipeline.PriorOrder(
+                priorMmsi, "MEDICINE", 10.0, NOW_MS - 60_000L, false, priorNestId);
+        return AdmissionPipeline.isDuplicate(request, List.of(prior), policy(), NOW_MS);
+    }
+
+    @Test
+    @DisplayName("★ 同船同货巢 → 是重复单")
+    void sameShipSameNest_shouldBeDuplicate() {
+        assertTrue(duplicate(requestAt("413800001", "N-1"), "413800001", "N-1"),
+                "同一艘船在同一时间窗内不该同时接两笔同货型同重量的单");
+    }
+
+    @Test
+    @DisplayName("★ 同货巢不同船 → 不再判重（货巢由系统选定，同巢是常态而非同批货的标识）")
+    void sameNestDifferentShip_shouldNotBeDuplicate() {
+        // 货巢决策归属改造后，货巢是系统按离船距离做的物流安排，同一座巢同时服务多条船
+        // 是常态。若按巢单独判重，不同船的两笔不同订单会被判成重复，正常订单被拒。
+        assertFalse(duplicate(requestAt("413800001", "N-1"), "413800999", "N-1"),
+                "同巢不同船不是同一批货，不能判重");
+    }
+
+    @Test
+    @DisplayName("★ 同船不同货巢 → 不是重复单（同一船可为两个巢的两批货下单）")
+    void sameShipDifferentNest_shouldNotBeDuplicate() {
+        assertFalse(duplicate(requestAt("413800001", "N-1"), "413800001", "N-2"),
+                "按 MMSI 判会把「同一船的两批不同货」误判成重复，正常订单被拒");
+    }
+
+    @Test
+    @DisplayName("本单未指定货巢 → 退回按船判（不能按 null==null 判重）")
+    void nullNest_shouldFallBackToMmsi() {
+        assertTrue(duplicate(requestAt("413800001", null), "413800001", "N-1"),
+                "同船同货型同重量同窗口，保守判重");
+        assertFalse(duplicate(requestAt("413800001", null), "413800999", "N-1"),
+                "两笔都没填货巢若按 null==null 判重，所有不填货巢的同货型订单都会被拒");
+    }
+
+    @Test
+    @DisplayName("本单指定货巢、既有单未指定 → 不同源（无从确认是同一批货）")
+    void requestedNestAgainstNullPrior_shouldNotBeDuplicate() {
+        assertFalse(duplicate(requestAt("413800001", "N-1"), "413800001", null));
+    }
+
+    @Test
+    @DisplayName("MED-BUG.28：mmsi 为 null 不抛 NPE（public 静态方法不能只靠调用方保证非空）")
+    void nullMmsi_shouldNotThrow() {
+        assertFalse(duplicate(requestAt(null, null), "413800001", "N-1"),
+                "改前 request.mmsi().equals(...) 在这里直接 NPE，把业务拒绝变成 500");
+        // 货巢路径不碰 mmsi，同样不应抛
+        assertFalse(duplicate(requestAt(null, "N-1"), "413800999", "N-1"));
     }
 }

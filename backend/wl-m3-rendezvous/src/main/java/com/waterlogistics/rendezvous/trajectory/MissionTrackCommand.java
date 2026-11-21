@@ -1,5 +1,7 @@
 package com.waterlogistics.rendezvous.trajectory;
 
+import com.waterlogistics.algo.meeting.GeoApprox;
+
 import java.util.Objects;
 
 
@@ -66,14 +68,16 @@ public record MissionTrackCommand(
 
 
     /**
-     * 合理纪元上界（2100-01-01），防后续时刻加法溢出
+     * 合理纪元上界（2100-01-01）；起飞时刻与三段累计结束时刻都须落在界内
      */
     private static final long MAX_EPOCH_MS = 4_102_444_800_000L;
 
     /**
      * 各段速度下限（m/s），防极低速导致航段时长不可控
      */
-    private static final double MIN_SPEED_MS = 0.1;
+    private static final double MIN_ALT_M = 1.0;
+
+    private static final double MAX_ALT_M = 10_000.0;
 
 
 
@@ -99,13 +103,16 @@ public record MissionTrackCommand(
                 || returnTargetLat < -90.0 || returnTargetLat > 90.0) {
             throw new IllegalArgumentException("三段几何坐标的经纬度超出合法范围");
         }
-        if (MissionTrackCommand.isSamePoint(nestLon, nestLat, meetLon, meetLat)
-                || MissionTrackCommand.isSamePoint(meetLon, meetLat, handoverEndLon, handoverEndLat)
-                || MissionTrackCommand.isSamePoint(handoverEndLon, handoverEndLat, returnTargetLon, returnTargetLat)) {
+        if (GeoApprox.distanceM(nestLon, nestLat, meetLon, meetLat) < 1e-3
+                || GeoApprox.distanceM(meetLon, meetLat, handoverEndLon, handoverEndLat) < 1e-3
+                || GeoApprox.distanceM(handoverEndLon, handoverEndLat, returnTargetLon, returnTargetLat) < 1e-3) {
             throw new IllegalArgumentException("相邻航段端点不得重合（退化航段）");
         }
-        if (!Double.isFinite(cruiseAltM) || !(cruiseAltM > (double) 0)) {
-            throw new IllegalArgumentException("巡航高度须为正的有限数，实际 " + cruiseAltM);
+        if (!Double.isFinite(cruiseAltM)
+                || cruiseAltM < MissionTrackCommand.MIN_ALT_M
+                || cruiseAltM > MissionTrackCommand.MAX_ALT_M) {
+            throw new IllegalArgumentException("巡航高度须在 [" + MissionTrackCommand.MIN_ALT_M + ", "
+                                                       + MissionTrackCommand.MAX_ALT_M + "] m 内，实际 " + cruiseAltM);
         }
         if (waypointsPerLeg < 2 || waypointsPerLeg > GenerateRouteCommand.MAX_WAYPOINT_COUNT) {
             throw new IllegalArgumentException(
@@ -113,12 +120,14 @@ public record MissionTrackCommand(
         }
         if (!Double.isFinite(outboundSpeedMs) || !Double.isFinite(terminalSpeedMs)
                 || !Double.isFinite(returnSpeedMs)
-                || outboundSpeedMs < MissionTrackCommand.MIN_SPEED_MS || terminalSpeedMs < MissionTrackCommand.MIN_SPEED_MS
-                || returnSpeedMs < MissionTrackCommand.MIN_SPEED_MS) {
+                || outboundSpeedMs < GenerateRouteCommand.MIN_SPEED_MS || terminalSpeedMs < GenerateRouteCommand.MIN_SPEED_MS
+                || returnSpeedMs < GenerateRouteCommand.MIN_SPEED_MS
+                || outboundSpeedMs > GenerateRouteCommand.MAX_SPEED_MS || terminalSpeedMs > GenerateRouteCommand.MAX_SPEED_MS
+                || returnSpeedMs > GenerateRouteCommand.MAX_SPEED_MS) {
             throw new IllegalArgumentException(
-                    "各段速度须不低于 " + MissionTrackCommand.MIN_SPEED_MS + " m/s 且为有限数，实际 outboundSpeedMs="
-                            + outboundSpeedMs + ", terminalSpeedMs=" + terminalSpeedMs
-                            + ", returnSpeedMs=" + returnSpeedMs);
+                    "各段速度须在 [" + GenerateRouteCommand.MIN_SPEED_MS + ", " + GenerateRouteCommand.MAX_SPEED_MS
+                            + "] m/s 且为有限数，实际 outboundSpeedMs=" + outboundSpeedMs
+                            + ", terminalSpeedMs=" + terminalSpeedMs + ", returnSpeedMs=" + returnSpeedMs);
         }
         if (takeoffMs <= 0L) {
             throw new IllegalArgumentException("起飞时刻必须为正，实际 " + takeoffMs);
@@ -126,23 +135,25 @@ public record MissionTrackCommand(
         if (takeoffMs > MissionTrackCommand.MAX_EPOCH_MS) {
             throw new IllegalArgumentException("起飞时刻超出合理纪元上界，实际 " + takeoffMs);
         }
+        double outboundSec = GeoApprox.distanceM(nestLon, nestLat, meetLon, meetLat) / outboundSpeedMs;
+        double terminalSec = GeoApprox.distanceM(meetLon, meetLat, handoverEndLon, handoverEndLat) / terminalSpeedMs;
+        double returnSec = GeoApprox.distanceM(handoverEndLon, handoverEndLat, returnTargetLon, returnTargetLat) / returnSpeedMs;
+        if (!Double.isFinite(outboundSec) || !Double.isFinite(terminalSec) || !Double.isFinite(returnSec)) {
+            throw new IllegalArgumentException("三段航程累计时长不可计算，实际各段秒数 "
+                                                       + outboundSec + "／" + terminalSec + "／" + returnSec);
+        }
+        // 与 TrackGenerator#generate 同口径：每段先按整秒取整，且时长至少 1 s，
+        // 三段顺序累加才是生成侧真实的末点时刻；一次四舍五入会低估累计误差
+        long totalMs = (Math.max(1L, Math.round(outboundSec))
+                + Math.max(1L, Math.round(terminalSec))
+                + Math.max(1L, Math.round(returnSec))) * 1000L;
+        if (totalMs > MissionTrackCommand.MAX_EPOCH_MS - takeoffMs) {
+            throw new IllegalArgumentException("三段航程累计结束时刻超出合理纪元上界，实际起飞时刻 " + takeoffMs
+                                                       + "、累计时长毫秒 " + totalMs);
+        }
     }
 
 
 
 
-
-    /**
-     * 端点重合判定：含极点等价（±90° 处任意经度为同一点）与 ±180° 经线等价
-     */
-    private static boolean isSamePoint(double lonA, double latA, double lonB, double latB) {
-        if (Math.abs(latA - latB) > 1e-9) {
-            return false;
-        }
-        if (Math.abs(latA) == 90.0) {
-            return true;
-        }
-        double dLon = Math.abs(lonA - lonB) % 360.0;
-        return dLon < 1e-9 || 360.0 - dLon < 1e-9;
-    }
 }

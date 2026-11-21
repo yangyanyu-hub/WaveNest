@@ -1,0 +1,382 @@
+package com.waterlogistics.app;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
+
+import com.waterlogistics.algo.inflight.HomecomingTier;
+import com.waterlogistics.contract.mq.AisMessage;
+import com.waterlogistics.contract.mq.AlertEventMessage;
+import com.waterlogistics.contract.rest.GateSource;
+import com.waterlogistics.contract.state.OrderStatus;
+import com.waterlogistics.dispatch.alert.AlertDrivenDispatcher;
+import com.waterlogistics.dispatch.alert.HomecomingDecisionEvent;
+import com.waterlogistics.dispatch.alert.WeatherClearWaker;
+import com.waterlogistics.dispatch.gate.DispatchGateService;
+import com.waterlogistics.dispatch.order.CargoReadyService;
+import com.waterlogistics.dispatch.order.OrderAdmissionService;
+import com.waterlogistics.dispatch.order.OrderSubmitRequest;
+import com.waterlogistics.dispatch.order.OrderSubmitResponse;
+import com.waterlogistics.dispatch.prediction.PredictionService;
+import com.waterlogistics.dispatch.queue.CargoGateWaker;
+import com.waterlogistics.dispatch.queue.TaskQueueService;
+import com.waterlogistics.dispatch.taskstate.FlightPhaseAdvancer;
+import com.waterlogistics.storage.entity.OrderTaskEntity;
+import com.waterlogistics.storage.entity.TaskLogEntity;
+import com.baomidou.mybatisplus.core.conditions.query.LambdaQueryWrapper;
+import com.waterlogistics.storage.repository.GoodsMapper;
+import com.waterlogistics.storage.repository.OrderTaskMapper;
+import com.waterlogistics.storage.repository.TaskLogMapper;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.List;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.stream.Collectors;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.event.EventListener;
+import org.springframework.transaction.annotation.Transactional;
+
+/**
+ * F1 告警驱动重调度完成判据（真实容器中间件：compose 四件套 healthy 前提下运行）：
+ * 三条分派路径各走对分支；坏消息吞掉不中断；气象解除边沿唤醒积压。
+ * 测试事务回滚，不污染演示库。
+ *
+ * <p>MQ 侧不经真实 Rabbit 转发，直接调 {@code route}（消息体契约已由 F0a 的
+ * Jackson 全自动映射保证）；监听器的队列拓扑在装配层冒烟时验证。
+ *
+ * <p><b>隔离口径</b>：{@code DecisionCapture} 与消费器的 eventId 去重集是<b>上下文级单例</b>，
+ * 事务只回滚 DB 不回滚内存态——广播断言一律按本用例的 eventId 过滤，不锁全量列表。
+ */
+@SpringBootTest(properties = {
+        // T1-5 起机巢在南昌航段、仿真器仍在旧域（杨添爻 T1-4 切换前），
+        // 仿真 AIS 流会覆盖本测试手喂的船位快照导致候选全灭——关掉仿真流，测试独占喂数
+        "wavenest.sim.enabled=false",
+        // 货到巢关的后台轮询会与断言抢同一批订单（还会去 FOR UPDATE 抢机巢行锁），
+        // 本类自己按需驱动放行，故关掉后台轮询
+        "wavenest.m2.cargo-gate-poll-enabled=false"})
+@Transactional
+class AlertDrivenRescheduleTest {
+
+    /**
+     * 测试专用船号。
+     *
+     * <p>不取演示船号 123456789：演示应用在跑时，它的仿真器每秒钟把该船号的 AIS 发到
+     * 消息队列，本测试手喂的船位快照会被覆盖，判定链读到的船位与测试预期不一致，
+     * 表现为「下单被判闸门熔断延后」「求解时快照已过期」这类与本用例无关的失败。
+     * 换成本用例独占的船号后，消息队列里演示应用的 AIS 影响不到本测试。
+     */
+    private static final String SHIP = "900000002";
+    private static final String DRONE = "UAV-01";
+    private static final long NOW = System.currentTimeMillis();
+
+    @Autowired
+    private AlertDrivenDispatcher dispatcher;
+    @Autowired
+    private WeatherClearWaker waker;
+    @Autowired
+    private OrderAdmissionService admissionService;
+    @Autowired
+    private PredictionService predictionService;
+    @Autowired
+    private DispatchGateService gateService;
+    @Autowired
+    private OrderTaskMapper orderTaskMapper;
+    @Autowired
+    private TaskLogMapper taskLogMapper;
+    @Autowired
+    private DecisionCapture capture;
+    @Autowired
+    private CargoReadyService cargoReadyService;
+    @Autowired
+    private CargoGateWaker cargoGateWaker;
+    @Autowired
+    private TaskQueueService taskQueueService;
+    @Autowired
+    private FlightPhaseAdvancer flightPhaseAdvancer;
+    @Autowired
+    private GoodsMapper goodsMapper;
+
+    /**
+     * 登记货物到巢并由货到巢关轮询放行派机。
+     *
+     * <p>下单时刻系统会选定货巢，货物随之建成「未就绪」，派单前必须登记到巢才能放行；
+     * 系统未选定货巢时订单本就不经门关，直接跳过。
+     */
+    private void releaseCargoGate(String orderId) {
+        OrderTaskEntity order = orderTaskMapper.selectById(orderId);
+        if (order == null || order.getCargoNestId() == null || order.getCargoNestId().isBlank()) {
+            return;
+        }
+        cargoReadyService.markReady(orderId, order.getCargoNestId());
+        cargoGateWaker.tick();
+    }
+
+    /** 收集返航复核广播（F1 的「广播」出口，进程内事件） */
+    @TestConfiguration
+    static class CaptureConfig {
+        @Bean
+        DecisionCapture decisionCapture() {
+            return new DecisionCapture();
+        }
+    }
+
+    static class DecisionCapture {
+        final List<HomecomingDecisionEvent> events = new CopyOnWriteArrayList<>();
+
+        @EventListener
+        void on(HomecomingDecisionEvent event) {
+            events.add(event);
+        }
+    }
+
+    /**
+     * 重复单判重键＝同船＋同货类＋重量差 ≤0.5 kg（80 §3.1.3）：每笔新单轮换白名单货类错开。
+     * 不用重量错开——机队 M30T 载重上界 6 kg、M400 只驻 NEST-01（NEST-02 不允许 M400），
+     * 重量一超 6 kg 同用例第二笔单就无候选可派。
+     */
+    private static final String[] CARGOS = {"医疗物资", "应急药品", "食品", "生活物资"};
+
+    private final java.util.concurrent.atomic.AtomicLong orderSeq = new java.util.concurrent.atomic.AtomicLong();
+
+    /** 前置：喂船位快照（候选距离过滤与会面求解前提），下单走完整主链到「已派发」 */
+    private String dispatchedOrder() {
+        // 船位取南昌赣江演示航段南昌大桥旁（T1-5 起机巢在航段两端，两巢均在 5km 内）
+        predictionService.refresh(new AisMessage(
+                SHIP, "F1测试船", 115.857937, 28.663776, 5.0, 90.0, System.currentTimeMillis()));
+        OrderSubmitResponse resp = admissionService.submit(new OrderSubmitRequest(
+                SHIP, 5.5, CARGOS[(int) (orderSeq.getAndIncrement() % CARGOS.length)],
+                System.currentTimeMillis() + 3_600_000L, "URGENT"));
+        assertThat(resp.accepted()).isTrue();
+        // 系统下单时刻选定货巢 → 货物建行为「未就绪」→ 登记到巢并由轮询放行后才派发
+        releaseCargoGate(resp.orderId());
+        OrderTaskEntity order = orderTaskMapper.selectById(resp.orderId());
+        assertThat(order.getStatus()).isEqualTo(OrderStatus.DISPATCHED.getValue());
+        assertThat(order.getMeetLon()).isNotNull();
+        return resp.orderId();
+    }
+
+    private List<HomecomingDecisionEvent> eventsOf(String... eventIds) {
+        return capture.events.stream()
+                .filter(event -> List.of(eventIds).contains(event.eventId()))
+                .collect(Collectors.toList());
+    }
+
+    private List<TaskLogEntity> logsOf(String orderId) {
+        return taskLogMapper.selectList(new LambdaQueryWrapper<TaskLogEntity>()
+                .eq(TaskLogEntity::getOrderId, orderId));
+    }
+
+    @Test
+    void deviationAlert_shouldRequeueAndRedispatch() {
+        String orderId = dispatchedOrder();
+
+        dispatcher.route(new AlertEventMessage(
+                "EV-D1", "偏航", "警告", 5, DRONE, orderId, NOW, 55.0, 30.0));
+
+        // 重调度＝重入队＋派发编排：订单再次走到「已派发」（演示口径，清单分派表第 1 行）
+        OrderTaskEntity after = orderTaskMapper.selectById(orderId);
+        assertThat(after.getStatus()).isEqualTo(OrderStatus.DISPATCHED.getValue());
+        assertThat(after.getDroneId()).isNotBlank();
+
+        List<TaskLogEntity> logs = logsOf(orderId);
+        assertThat(logs).extracting(TaskLogEntity::getOpType)
+                .contains("重入队");
+        assertThat(logs).extracting(TaskLogEntity::getOpType)
+                .filteredOn(op -> "派发".equals(op))
+                .hasSizeGreaterThanOrEqualTo(2);
+    }
+
+    @Test
+    void lowBatteryAlert_shouldReviewAndBroadcast() {
+        String orderId = dispatchedOrder();
+
+        // 5% 电量且告警位置在两巢之间：原巢与他巢均不可达 → 第三级迫降野外。
+        // 生产链现在会从 nest/occupancy_slot 组装他巢候选，不能再假定候选为空。
+        dispatcher.route(new AlertEventMessage(
+                "EV-L1", "低电量", "警告", 10, DRONE, orderId, NOW, 5.0, 20.0,
+                115.8575, 28.6700));
+
+        List<HomecomingDecisionEvent> mine = eventsOf("EV-L1");
+        assertThat(mine).hasSize(1);
+        assertThat(mine.get(0).orderId()).isEqualTo(orderId);
+        assertThat(mine.get(0).tier()).isEqualTo(HomecomingTier.EMERGENCY_LAND_FIELD);
+        assertThat(mine.get(0).reason()).isNotBlank();
+
+        // 决策落审计：task_log 有「返航复核-低电量」，审计不流转状态
+        assertThat(logsOf(orderId)).extracting(TaskLogEntity::getOpType)
+                .contains("返航复核-低电量");
+    }
+
+    @Test
+    void lowBatteryHigh_shouldReturnHomeNest() {
+        String orderId = dispatchedOrder();
+
+        // 电量 60% ≥ 40% → 第一级回原巢（A1 判据正向）
+        dispatcher.route(new AlertEventMessage(
+                "EV-L2", "低电量", "提示", 3, DRONE, orderId, NOW, 60.0, 20.0));
+
+        List<HomecomingDecisionEvent> mine = eventsOf("EV-L2");
+        assertThat(mine).hasSize(1);
+        assertThat(mine.get(0).tier()).isEqualTo(HomecomingTier.RETURN_HOME_NEST);
+    }
+
+    @Test
+    void lostLinkAlert_shouldSkipReviewBecauseBatteryUnavailable() {
+        String orderId = dispatchedOrder();
+
+        // MEDIUM.7：失联属非低电量告警，不得复用 drone 表最近电量去判「回不回得来」；
+        // 电量不可得 → 组装器返回 null → 复核不启动、不广播、不落复核审计
+        dispatcher.route(new AlertEventMessage(
+                "EV-K1", "失联", "严重", 35, DRONE, orderId, NOW, null, null));
+
+        assertThat(eventsOf("EV-K1")).isEmpty();
+        assertThat(logsOf(orderId)).extracting(TaskLogEntity::getOpType)
+                .doesNotContain("返航复核-失联");
+    }
+
+    @Test
+    void sameEventId_shouldReviewOnlyOnce() {
+        String orderId = dispatchedOrder();
+
+        // 同一 eventId 的「级别变化」复用 id 再发——复核只做一次（G-01 贯穿始终）
+        dispatcher.route(new AlertEventMessage(
+                "EV-L3", "低电量", "警告", 10, DRONE, orderId, NOW, 18.0, 20.0));
+        dispatcher.route(new AlertEventMessage(
+                "EV-L3", "低电量", "严重", 40, DRONE, orderId, NOW, 10.0, 10.0));
+
+        assertThat(eventsOf("EV-L3")).hasSize(1);
+    }
+
+    @Test
+    void badMessage_shouldBeSwallowedAndQueueAlive() {
+        // 未知类型：onAlertEvent 吞掉不向外抛（边界 3）
+        assertThatCode(() -> dispatcher.onAlertEvent(new AlertEventMessage(
+                "EV-X1", "不存在的类型", "警告", 1, DRONE, "ORDER-404", NOW, 1.0, 1.0)))
+                .doesNotThrowAnyException();
+        // 缺订单号的偏航：跳过不抛
+        assertThatCode(() -> dispatcher.route(new AlertEventMessage(
+                "EV-X2", "偏航", "严重", 1, "UAV-NOT-BOUND", null, NOW, 99.0, 30.0)))
+                .doesNotThrowAnyException();
+
+        // 队列仍然活着：随后的合法消息正常处理
+        String orderId = dispatchedOrder();
+        dispatcher.route(new AlertEventMessage(
+                "EV-D2", "偏航", "警告", 5, DRONE, orderId, NOW, 55.0, 30.0));
+        assertThat(orderTaskMapper.selectById(orderId).getStatus())
+                .isEqualTo(OrderStatus.DISPATCHED.getValue());
+        assertThat(eventsOf("EV-X1", "EV-X2", "EV-D2")).isEmpty();
+    }
+
+    @Test
+    void weatherClear_shouldWakeBacklog() {
+        predictionService.refresh(new AisMessage(
+                SHIP, "F1测试船", 115.857937, 28.663776, 5.0, 90.0, System.currentTimeMillis()));
+
+        // 熔断中下单 → B3 延后语义：已受理待唤醒（不是拒单）
+        gateService.trip(GateSource.AUTO);
+        OrderSubmitResponse resp = admissionService.submit(new OrderSubmitRequest(
+                SHIP, 5.5, "医疗物资", System.currentTimeMillis() + 3_600_000L, "URGENT"));
+        assertThat(resp.accepted()).isTrue();
+        // 延后单从未过门关、没有持锁：先登记货物到巢，解除熔断后由气象唤醒器直接续编排到「已派发」
+        OrderTaskEntity deferredRow = orderTaskMapper.selectById(resp.orderId());
+        if (deferredRow.getCargoNestId() != null && !deferredRow.getCargoNestId().isBlank()) {
+            cargoReadyService.markReady(resp.orderId(), deferredRow.getCargoNestId());
+        }
+        assertThat(orderTaskMapper.selectById(resp.orderId()).getStatus())
+                .isEqualTo(OrderStatus.ACCEPTED_WAIT_WAKE.getValue());
+
+        // 闸门仍闭：轮询不唤醒（边沿未命中）
+        waker.tick();
+        assertThat(orderTaskMapper.selectById(resp.orderId()).getStatus())
+                .isEqualTo(OrderStatus.ACCEPTED_WAIT_WAKE.getValue());
+
+        // 气象解除（B2 clear）→ 边沿命中 → 逐单重入队＋续编排
+        gateService.clear(GateSource.AUTO);
+        waker.tick();
+
+        OrderTaskEntity after = orderTaskMapper.selectById(resp.orderId());
+        assertThat(after.getStatus()).isEqualTo(OrderStatus.DISPATCHED.getValue());
+        assertThat(after.getDroneId()).isNotBlank();
+        assertThat(logsOf(resp.orderId())).extracting(TaskLogEntity::getOpType)
+                .contains("闸门熔断-延后", "重入队");
+
+        // 闸门持续打开：再拍不重复唤醒（边沿触发，订单已不在积压）
+        waker.tick();
+        assertThat(orderTaskMapper.selectById(resp.orderId()).getStatus())
+                .isEqualTo(OrderStatus.DISPATCHED.getValue());
+    }
+
+    /**
+     * 11-16 序号 3-5：<b>熔断解除后被唤醒的积压订单要一路走到交接完成</b>，不只是「重派成功」。
+     *
+     * <p>「重派」只证到「已派发」，而整改要求的是七段故事线里最后那段——解除后积压单被重派
+     * <b>并完成交接</b>。中间任一环断掉（重入队后没人续编排、派发后飞行阶段不推进、
+     * 回执落不上凭证）都会表现成「订单停在已派发不动」，演示现场看起来就是卡住。
+     *
+     * <p>飞行阶段推进靠 <b>会面时刻回拨</b>触发时间兜底（与 {@code SmokeM6M2Test} 同手法），
+     * 不 mock 时钟：本用例要验的是真实推进器在真实库状态下的行为。
+     */
+    @Test
+    void weatherClear_shouldWakeBacklogThenCompleteHandover() {
+        predictionService.refresh(new AisMessage(
+                SHIP, "F1交接测试船", 115.857937, 28.663776, 5.0, 90.0, System.currentTimeMillis()));
+
+        // ① 熔断中下单：B3 延后语义，落「已受理待唤醒」而不是拒单
+        gateService.trip(GateSource.AUTO);
+        OrderSubmitResponse resp = admissionService.submit(new OrderSubmitRequest(
+                SHIP, 5.5, "医疗物资", System.currentTimeMillis() + 3_600_000L, "URGENT"));
+        assertThat(resp.accepted()).isTrue();
+        String orderId = resp.orderId();
+        // 延后单从未过门关、没有持锁：只登记货物到巢，解除后由气象唤醒器直接续编排
+        OrderTaskEntity deferred = orderTaskMapper.selectById(orderId);
+        if (deferred.getCargoNestId() != null && !deferred.getCargoNestId().isBlank()) {
+            cargoReadyService.markReady(orderId, deferred.getCargoNestId());
+        }
+        assertThat(orderTaskMapper.selectById(orderId).getStatus())
+                .isEqualTo(OrderStatus.ACCEPTED_WAIT_WAKE.getValue());
+
+        // ② 气象解除 → 边沿命中 → 逐单重入队并续编排（重派到「已派发」）
+        waker.tick();
+        gateService.clear(GateSource.AUTO);
+        waker.tick();
+        OrderTaskEntity dispatched = orderTaskMapper.selectById(orderId);
+        assertThat(dispatched.getStatus())
+                .as("解除后积压单必须被重派，不能停在待唤醒")
+                .isEqualTo(OrderStatus.DISPATCHED.getValue());
+        assertThat(dispatched.getDroneId()).isNotBlank();
+        assertThat(dispatched.getMeetTime()).isNotNull();
+
+        // ③ 把会面时刻回拨到已过时刻，让时间兜底把飞行阶段推到返航中（可写回执的阶段）
+        dispatched.setMeetTime(LocalDateTime.ofInstant(
+                Instant.ofEpochMilli(System.currentTimeMillis() - 3_600_000L),
+                ZoneId.of("Asia/Shanghai")));
+        orderTaskMapper.updateById(dispatched);
+        flightPhaseAdvancer.tick();
+        assertThat(orderTaskMapper.selectById(orderId).getStatus())
+                .as("飞行阶段推进须把已派发推到返航中；停在原状态说明推进链断了")
+                .isEqualTo(OrderStatus.RETURNING.getValue());
+
+        // ④ 交接回执：货物「已交付」＋ task_log 交付凭证，重复回执幂等
+        taskQueueService.markHandoverDone(orderId);
+        taskQueueService.markHandoverDone(orderId);
+        String goodsId = "G-" + orderId + "-1";
+        assertThat(goodsMapper.selectById(goodsId).getStatus())
+                .as("交接完成后货物必须是已交付")
+                .isEqualTo(com.waterlogistics.contract.state.GoodsStatus.DELIVERED.getValue());
+        assertThat(taskLogMapper.selectList(new LambdaQueryWrapper<TaskLogEntity>()
+                        .eq(TaskLogEntity::getOrderId, orderId)
+                        .eq(TaskLogEntity::getOpType, TaskQueueService.OP_TYPE_DELIVERY_RECEIPT)))
+                .as("重复回执幂等：交付凭证只写一次")
+                .hasSize(1);
+
+        // ⑤ 下一拍凭交付凭证推「已完成」
+        flightPhaseAdvancer.tick();
+        assertThat(orderTaskMapper.selectById(orderId).getStatus())
+                .as("有交付凭证后必须能走到已完成；停住说明收尾链断了")
+                .isEqualTo(OrderStatus.FINISHED.getValue());
+    }
+}

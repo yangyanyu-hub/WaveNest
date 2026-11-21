@@ -50,8 +50,92 @@ public record OrderRequeueCommand(
         if (landingPointId == null || landingPointId.isBlank()) {
             throw new IllegalArgumentException("落点标识不得为空：野外迫降与落巢走不同的货物去向（《21》§8）");
         }
+        // 评审 OrderRequeueCommand:53：回收确认以「落巢」为前提（《21》§8），
+        // 未落巢却已确认回收在物理上不成立，须在构造层拒绝，不能留给下游某个调用方
+        if (!landedAtNest && recyclingConfirmed) {
+            throw new IllegalArgumentException(
+                    "回收确认与落巢冲突：货物须随原机成功落巢后才可被回收为可用（《21》§8）");
+        }
+        if (lossConfirmed && recyclingConfirmed) {
+            throw new IllegalArgumentException("灭失与回收确认互斥：货物已灭失就不可能再确认回收");
+        }
         if (lossConfirmed && landedAtNest) {
             throw new IllegalArgumentException("灭失与落巢互斥：灭失后无人机不存在，不可能有落巢记录");
+        }
+    }
+
+    /**
+     * 具名构造入口。七个布尔与标识字段相邻时容易传错位，调用方改用本入口后
+     * 不必再按位置记忆参数顺序。
+     *
+     * <p><b>LOW.27 维持缓置（不改成「落点结论」枚举）</b>：评审建议把
+     * {@code landedAtNest}、{@code recyclingConfirmed}、{@code lossConfirmed} 三个布尔
+     * 收敛成一个落点枚举，让非法组合在类型层不可表达。本批不做，两条理由：
+     * 一是全仓<b>没有生产构造点</b>，只有单测在构造（生产侧重派入口尚未接本命令对象），
+     * 位置传参传错的风险目前只存在于测试里，而测试已全部改用 {@link #builder()} 具名传参；
+     * 二是换枚举要同时改本类、单测与将来的生产入口，而重派链正被 2-2 与 2-3 改动覆盖，
+     * 同批换类型会让回归面混在一起，出问题分不清是契约错还是重构错。
+     * 等 (2-2) 接生产入口、落点取值确定后，按当时的调用形态一并定（若只用两三种落点，
+     * 具名静态工厂比枚举更贴）。
+     *
+     * @return 新的构造器
+     */
+    public static Builder builder() {
+        return new Builder();
+    }
+
+    /** {@link OrderRequeueCommand} 的具名构造器。 */
+    public static final class Builder {
+
+        private String orderId;
+        private String goodsId;
+        private String droneId;
+        private boolean landedAtNest;
+        private String landingPointId;
+        private boolean recyclingConfirmed;
+        private boolean lossConfirmed;
+
+        private Builder() {
+        }
+
+        public Builder orderId(String value) {
+            this.orderId = value;
+            return this;
+        }
+
+        public Builder goodsId(String value) {
+            this.goodsId = value;
+            return this;
+        }
+
+        public Builder droneId(String value) {
+            this.droneId = value;
+            return this;
+        }
+
+        public Builder landedAtNest(boolean value) {
+            this.landedAtNest = value;
+            return this;
+        }
+
+        public Builder landingPointId(String value) {
+            this.landingPointId = value;
+            return this;
+        }
+
+        public Builder recyclingConfirmed(boolean value) {
+            this.recyclingConfirmed = value;
+            return this;
+        }
+
+        public Builder lossConfirmed(boolean value) {
+            this.lossConfirmed = value;
+            return this;
+        }
+
+        public OrderRequeueCommand build() {
+            return new OrderRequeueCommand(orderId, goodsId, droneId, landedAtNest,
+                    landingPointId, recyclingConfirmed, lossConfirmed);
         }
     }
 }

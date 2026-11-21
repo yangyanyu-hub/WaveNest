@@ -1,8 +1,22 @@
 package com.waterlogistics.app.config;
 
+import com.waterlogistics.algo.meeting.model.B_ConflictResult;
+import com.waterlogistics.algo.meeting.model.B_FlyableRoute;
+import com.waterlogistics.algo.meeting.model.B_HandoverConfirmation;
+import com.waterlogistics.algo.meeting.model.B_TakeoffTimeResult;
+import com.waterlogistics.dispatch.homecoming.HomecomingTrackPort;
+import com.waterlogistics.dispatch.plan.MissionTrackPort;
+import com.waterlogistics.dispatch.rendezvous.NestLookup;
+import com.waterlogistics.dispatch.rendezvous.RendezvousPort;
+import com.waterlogistics.dispatch.rendezvous.RendezvousVerificationPort;
+import com.waterlogistics.rendezvous.conflict.ConflictParams;
 import com.waterlogistics.rendezvous.facade.RendezvousFacade;
+import com.waterlogistics.rendezvous.handover.HandoverCommand;
 import com.waterlogistics.rendezvous.port.DroneContextPort;
 import com.waterlogistics.rendezvous.port.TrajectorySnapshotPort;
+import com.waterlogistics.rendezvous.trajectory.TakeoffTimeCommand;
+import com.waterlogistics.storage.entity.NestEntity;
+import com.waterlogistics.storage.repository.NestMapper;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 
@@ -37,5 +51,91 @@ public class RendezvousWiring {
     public RendezvousFacade rendezvousFacade(TrajectorySnapshotPort snapshotPort,
             DroneContextPort droneContextPort) {
         return new RendezvousFacade(snapshotPort, droneContextPort);
+    }
+
+    /**
+     * 会面求解端口：M2 只依赖 M2 自己的接口，实现转调 M3 门面。
+     *
+     * @param facade 动态会面门面
+     * @return 会面求解端口的实现
+     */
+    @Bean
+    public RendezvousPort rendezvousPort(RendezvousFacade facade) {
+        return facade::solve;
+    }
+
+    /**
+     * 会面定案校验端口：起飞时刻回填、空域冲突二查、末段交接判定，实现全部转调 M3 门面。
+     *
+     * <p>与 {@link #rendezvousPort} 分开成独立 Bean：三项能力各有独立入参类型，
+     * 且由 {@code DispatchPlanVerifier} 按固定顺序调用；M2 侧不出现门面类型。
+     *
+     * @param facade 动态会面门面
+     * @return 定案校验端口的实现
+     */
+    @Bean
+    public RendezvousVerificationPort rendezvousVerificationPort(RendezvousFacade facade) {
+        return new RendezvousVerificationPort() {
+            @Override
+            public B_TakeoffTimeResult computeTakeoffTime(TakeoffTimeCommand cmd) {
+                return facade.computeTakeoffTime(cmd);
+            }
+
+            @Override
+            public B_ConflictResult detectConflict(B_FlyableRoute route, B_FlyableRoute other,
+                    ConflictParams params) {
+                return facade.detectConflict(route, other, params);
+            }
+
+            @Override
+            public B_HandoverConfirmation judgeHandover(HandoverCommand cmd) {
+                return facade.judgeHandover(cmd);
+            }
+        };
+    }
+
+    /**
+     * 返航航迹生成端口：M2 返航复核只依赖 M2 自己的接口，实现转调 M3 门面。
+     *
+     * @param facade 动态会面门面
+     * @return 返航航迹端口的实现
+     */
+    @Bean
+    public HomecomingTrackPort homecomingTrackPort(RendezvousFacade facade) {
+        return facade::generateTrack;
+    }
+
+    /**
+     * 航迹生成端口：M2 编排层只依赖 M2 自己的接口，实现转调 M3 门面的单段航迹生成方法。
+     *
+     * @param facade 动态会面门面
+     * @return 航迹生成端口的实现
+     */
+    @Bean
+    public MissionTrackPort missionTrackPort(RendezvousFacade facade) {
+        return facade::generateTrack;
+    }
+
+    /**
+     * 机巢坐标查询端口：会面求解按货物所在巢取起点时使用。
+     *
+     * @param nestMapper 机巢表
+     * @return 只读查询实现；查无或坐标缺失返回 {@code null}
+     */
+    @Bean
+    public NestLookup nestLookup(NestMapper nestMapper) {
+        return nestId -> {
+            NestEntity nest = nestMapper.selectById(nestId);
+            if (nest == null || nest.getLon() == null || nest.getLat() == null) {
+                return null;
+            }
+            double lon = nest.getLon().doubleValue();
+            double lat = nest.getLat().doubleValue();
+            if (!Double.isFinite(lon) || lon < -180.0 || lon > 180.0
+                    || !Double.isFinite(lat) || lat < -90.0 || lat > 90.0) {
+                return null;
+            }
+            return new NestLookup.NestPosition(nest.getNestId(), lon, lat);
+        };
     }
 }

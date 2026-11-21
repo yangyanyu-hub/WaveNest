@@ -1,6 +1,8 @@
 package com.waterlogistics.collector.publisher;
 
 import com.waterlogistics.contract.mq.AisMessage;
+import com.waterlogistics.contract.mq.DeliveryReceipt;
+import com.waterlogistics.contract.mq.GoodsRecycleConfirmation;
 import com.waterlogistics.contract.mq.TopicName;
 import com.waterlogistics.contract.mq.UavTelemetry;
 import com.waterlogistics.contract.mq.WeatherData;
@@ -44,6 +46,16 @@ public class MqDataPublisher implements DataPublisher {
     @Override
     public void publishWeather(WeatherData msg) {
         send(TopicName.DATA_WEATHER, msg);
+    }
+
+    @Override
+    public void publishDeliveryReceipt(DeliveryReceipt msg) {
+        send(TopicName.DATA_UAV_DELIVERY, msg);
+    }
+
+    @Override
+    public void publishGoodsRecycleConfirmation(GoodsRecycleConfirmation msg) {
+        send(TopicName.DATA_UAV_RECYCLE, msg);
     }
 
     private void send(String routingKey, Object payload) {

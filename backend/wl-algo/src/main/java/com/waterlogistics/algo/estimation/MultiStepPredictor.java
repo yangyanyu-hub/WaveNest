@@ -21,7 +21,10 @@ import java.util.List;
  *       {@code v_s < 0} 时衰减目标也是负值，否则会被往反方向拉。{@code |v_s| > limit} 时按
  *       {@code v(t) = v_lim + (v_s − v_lim)·exp(−t/tauV)} 一阶衰减。</li>
  *   <li><b>沿程推进</b>：对第 2 步闭式做<b>解析积分</b>（不用矩形积分，避免逐步累积偏差）。
- *       跨航段时在新航段限速处重新起算（以细分步实现「分段处理」，细分长度同时受航段边界约束）。</li>
+ *       跨航段时在新航段限速处重新起算（以细分步实现「分段处理」，细分长度同时受航段几何边界
+ *       与 {@link SpeedLimitLookup#switchPointsM() 限速切换点}共同约束）。
+ *       落到顶点边界前几纳米时<b>吸附</b>到边界再续推（见 {@link #LENGTH_EPS_M}），
+ *       不把浮点残差当成「已到端点」而丢弃剩余时间。</li>
  *   <li><b>横向</b>：{@code e_pred(τ)} 与 {@code Var_e(τ)} 委托 {@link LateralForecast}，
  *       由步骤 D 的 OU 转移给出（{@code Var_e(τ) = φ²·Var_e(0) + (1−φ²)·σ_e²}，
  *       {@code φ = exp(−τ/τ_e)}——§3.2.6 的离散传播；§3.2.7 第 4 步写的
@@ -60,6 +63,26 @@ public final class MultiStepPredictor {
 
     /** 子步长积分的时间容差，s。 */
     private static final double TIME_EPS_SEC = 1.0e-9;
+
+    /**
+     * <b>弧长</b>比较的容差，m——必须与 {@link #TIME_EPS_SEC} 分开，不得共用一个常量。
+     *
+     * <p><b>为什么（11-04 内部顶点边界冻结缺陷）</b>：解析积分推进到顶点时，{@code s} 会落在
+     * 边界<b>之前</b>几纳米（纯浮点残差；M4 现场验证实测 2.4e-9 m）。原先两处比较共用
+     * {@code 1e-9}：这个以「米」为单位的残差被当成「到边界的距离」，除以船速后不足
+     * {@code 1e-9 s}，推进循环据此判定「已顶到端点」，把那一点的剩余时间（40 s）整体丢弃；
+     * 下一拍 {@code s} 仍差那几纳米，于是<b>永久冻结</b>——现象是 τ 之后各预测点经纬度完全重合。
+     *
+     * <p><b>取 1e-6 m（1 微米）的理由</b>：
+     * <ol>
+     *   <li>远大于折线累计长度的浮点残差量级（{@code s ≈ 5.8 km} 时 ulp 约 1e-12 m，
+     *       实测残差 2.4e-9 m），足以把「贴住边界」与「还差一截」分开；</li>
+     *   <li>物理上完全可忽略：AIS 位置噪声是米级、2σ 带宽是十米级，吸附 1 微米不改变任何判据；</li>
+     *   <li>与最快船速 6 m/s 组合仍给出 {@code 1.7e-7 s} 的子步，比时间容差大六个数量级，
+     *       不会反过来把「贴边界」误判成「时间步过短」。</li>
+     * </ol>
+     */
+    private static final double LENGTH_EPS_M = 1.0e-6;
 
     private MultiStepPredictor() {
     }
@@ -158,6 +181,21 @@ public final class MultiStepPredictor {
 
         /** 弧长 {@code s} 处的航段限速绝对值，m/s。 */
         double speedLimitMs(double s);
+
+        /**
+         * 限速切换点的弧长位置，m（升序，只含 {@code 0 < s < 中心线总长} 的内部点）。
+         *
+         * <p><b>为什么需要</b>：{@link MultiStepPredictor} 的子步必须被「限速发生变化的位置」
+         * 切断。解析积分（{@code 80} §3.2.7 第 3 步）要求子步内 {@code v_lim} 是常量；只按几何
+         * 顶点切分时，若切换点与顶点不重合，一个子步会跨过切换点、整步沿用跨越前的限速，
+         * 违背「跨入新航段则按新航段限速从跨越点重新起算」。
+         *
+         * <p>默认空数组：常数限速（{@link #constant}）与不限速（{@link #unbounded}）没有切换点，
+         * 行为与加本方法之前完全一致。实现方可以返回内部缓存数组，<b>调用方不得修改返回值</b>。
+         */
+        default double[] switchPointsM() {
+            return new double[0];
+        }
 
         /** 不限速（限速取一个不可能达到的大值），用于无航道限速数据的演示。 */
         static SpeedLimitLookup unbounded() {
@@ -357,6 +395,11 @@ public final class MultiStepPredictor {
 
         List<Sample> samples = new ArrayList<>(pointCount);
 
+        // 子步只允许落在「几何顶点」或「限速切换点」上：解析积分要求子步内 v_lim 是常量。
+        // 两组边界在循环外取一次——segmentBoundariesM() 内部是 clone()，逐子步取会反复分配。
+        double[] segmentBoundaries = input.geometry().segmentBoundariesM();
+        double[] switchPoints = input.speedLimit().switchPointsM();
+
         // τ = 0：当前估计（不含 α·τ）
         double sigmaAlong0 = Math.sqrt(Math.max(0.0, input.pSS()));
         double sigmaCross0 = Math.min(Math.sqrt(Math.max(0.0, input.lateral().varianceE(0.0)))
@@ -373,14 +416,29 @@ public final class MultiStepPredictor {
             double targetTau = index * stepSec;
             while (tau < targetTau - TIME_EPS_SEC) {
                 double remaining = targetTau - tau;
-                // 子步：不超过剩余时长，且不越过航段边界（分汊/限速变化的处理口径）
-                double stepLength = Math.min(remaining, distanceToSegmentEnd(input.geometry(), s, v, total));
-                if (!(stepLength > TIME_EPS_SEC)) {
-                    // 已顶到中心线端点或船停住：剩余时间不再推进（越界由数据有效性闸门处置）
-                    s = clampToWaterway(s, total);
+                if (Math.abs(v) < VELOCITY_EPS_MS) {
+                    // 船停住：s 不推进，剩余时间不再消耗（σ 仍按 τ 增长）
                     tau = targetTau;
                     break;
                 }
+
+                // 沿行进方向的下一个边界（几何顶点或限速切换点，严格大于/小于 s，不含当前所在位置）
+                double boundary = nextBoundaryM(segmentBoundaries, switchPoints, s, v, total);
+                double gapM = Math.abs(boundary - s);
+                if (gapM <= LENGTH_EPS_M) {
+                    // 解析积分落到边界前几纳米（浮点残差）：吸附到边界的精确值，不丢弃剩余时间。
+                    s = clampToWaterway(boundary, total);
+                    if (s <= 0.0 || s >= total) {
+                        // 真到中心线端点：剩余时间不再推进（越界由数据有效性闸门处置）
+                        tau = targetTau;
+                        break;
+                    }
+                    // 内部顶点：吸附不耗时间，下一轮 from 新航段取限速、重新起算
+                    continue;
+                }
+
+                // 子步：不超过剩余时长，且不越过航段边界（分段限速的处理口径）
+                double stepLength = Math.min(remaining, gapM / Math.abs(v));
                 double[] advanced = advanceOneSubStep(s, v, stepLength, params, input.speedLimit());
                 s = clampToWaterway(advanced[0], total);
                 v = advanced[1];
@@ -479,31 +537,49 @@ public final class MultiStepPredictor {
     }
 
     /**
-     * 沿当前行进方向到<b>下一个航段边界</b>所需的时间，s；已到端点或几乎静止时返回极大值。
+     * 沿当前行进方向<b>下一个切分点</b>的弧长值，m（上行取更大者、下行取更小者）；
+     * 没有内部切分点时取中心线端点（上行 {@code total}、下行 {@code 0}）。
      *
-     * <p>用于把「跨入新航段则按新航段限速重新起算」落实到子步划分上：子步不被允许跨过边界，
+     * <p>切分点有两类，取其中离当前位置最近的一个：
+     * <ol>
+     *   <li><b>几何顶点</b>（{@code segmentBoundaries}）——跨顶点后中心线走向改变，反投影基准也变；</li>
+     *   <li><b>限速切换点</b>（{@link SpeedLimitLookup#switchPointsM()}）——跨切换点后
+     *       {@code v_lim} 改变，解析积分必须从跨越点重新起算（{@code 80} §3.2.7 第 3 步）。</li>
+     * </ol>
+     * 只按顶点切分时，切换点与顶点不重合的子步会整步沿用旧限速，误差可达百米量级。
+     *
+     * <p>用于把「跨入新航段则按新航段限速重新起算」落实到子步划分上：子步不被允许跨过任一切分点，
      * 因此每个子步内的限速是常量，解析积分成立。
+     *
+     * <p><b>为什么这里用严格比较而不是 {@code + LENGTH_EPS_M}</b>：容差写在推进循环里，
+     * 语义是「落到边界前不到 1 微米就吸附过去」。若在这里把 1 微米内的边界直接跳过，
+     * 子步就会跨过该切分点，整步沿用旧的限速——那正是分段处理要避免的错误。
      */
-    private static double distanceToSegmentEnd(WaterwayGeometry geometry, double s, double v, double total) {
-        if (Math.abs(v) < VELOCITY_EPS_MS) {
-            return Double.MAX_VALUE;
+    private static double nextBoundaryM(double[] segmentBoundaries, double[] switchPoints,
+            double s, double v, double total) {
+        double best = v > 0.0 ? total : 0.0;
+        for (double boundary : segmentBoundaries) {
+            best = nearerAhead(best, boundary, s, v, total);
         }
-        double[] boundaries = geometry.segmentBoundariesM();
-        double speed = Math.abs(v);
+        for (double switchPoint : switchPoints) {
+            best = nearerAhead(best, switchPoint, s, v, total);
+        }
+        return best;
+    }
+
+    /**
+     * 候选切分点在行进方向上、且比当前更近时采纳；端点与越界值由 {@code total}／{@code 0} 兜底，
+     * 不参与比较（{@code switchPointsM()} 契约只保证内部点，几何端点另由基准值覆盖）。
+     */
+    private static double nearerAhead(double current, double candidate, double s, double v,
+            double total) {
+        if (!(candidate > 0.0) || !(candidate < total)) {
+            return current;
+        }
         if (v > 0.0) {
-            for (double boundary : boundaries) {
-                if (boundary > s + TIME_EPS_SEC) {
-                    return (boundary - s) / speed;
-                }
-            }
-            return (total - s) / speed;
+            return (candidate > s && candidate < current) ? candidate : current;
         }
-        for (int i = boundaries.length - 1; i >= 0; i--) {
-            if (boundaries[i] < s - TIME_EPS_SEC) {
-                return (s - boundaries[i]) / speed;
-            }
-        }
-        return s / speed;
+        return (candidate < s && candidate > current) ? candidate : current;
     }
 
     /**

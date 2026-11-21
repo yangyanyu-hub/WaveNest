@@ -92,7 +92,7 @@ class TrackGeneratorTest {
         for (int i = 1; i < route.waypoints().size(); i++) {
             assertTrue(route.waypoints().get(i).t() > route.waypoints().get(i - 1).t(), "时间仍严格递增");
         }
-        assertEquals(0.5 / 15.0 * 0.05, route.energyExact(), 1e-6, "能耗按未舍入时长计（0.5 m ÷ 15 m/s）");
+        assertEquals(1.0 * 0.05, route.energyExact(), 1e-9, "能耗按整秒时长计（钳制后 1 s × 0.05%/s）");
     }
 
     /** 分段口径词唯一：fromValue 首个匹配即返回，重复会导致解析错段。 */
@@ -152,6 +152,28 @@ class TrackGeneratorTest {
             assertTrue(track.points().get(i).waypoint().t() >= track.points().get(i - 1).waypoint().t(),
                     "整体时间单调不减");
         }
+    }
+
+    /** 截断航迹：只有去程段，或去程加末段交接，都不得冒充三段航迹。 */
+    @Test
+    void segmentedTrack_shouldRejectTruncatedTrack() {
+        List<SegmentedWaypoint> outboundOnly = List.of(
+                new SegmentedWaypoint(
+                        new Waypoint(lonAt(0), LAT0, 60.0, 15.0, T0), TrackSegment.OUTBOUND),
+                new SegmentedWaypoint(
+                        new Waypoint(lonAt(100), LAT0, 60.0, 15.0, T0 + 10_000L), TrackSegment.OUTBOUND));
+
+        assertThrows(IllegalArgumentException.class, () -> new SegmentedTrack(outboundOnly),
+                "只有去程段的航迹必须拒绝");
+
+        List<SegmentedWaypoint> withoutReturn = List.of(
+                new SegmentedWaypoint(
+                        new Waypoint(lonAt(0), LAT0, 60.0, 15.0, T0), TrackSegment.OUTBOUND),
+                new SegmentedWaypoint(
+                        new Waypoint(lonAt(100), LAT0, 60.0, 15.0, T0 + 10_000L), TrackSegment.TERMINAL));
+
+        assertThrows(IllegalArgumentException.class, () -> new SegmentedTrack(withoutReturn),
+                "末段不是返程的航迹必须拒绝");
     }
 
     // ===== 夹具 =====

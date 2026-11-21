@@ -1,0 +1,197 @@
+package com.waterlogistics.dispatch.alert;
+
+import com.waterlogistics.contract.mq.AlertEventMessage;
+import com.waterlogistics.contract.mq.TopicName;
+import com.waterlogistics.contract.rest.WaitReason;
+import com.waterlogistics.contract.state.AlertLevel;
+import com.waterlogistics.contract.state.AlertType;
+import com.waterlogistics.contract.order.OrderStateChangedEvent;
+import com.waterlogistics.dispatch.queue.CargoNestGate;
+import com.waterlogistics.storage.entity.AlertEntity;
+import com.waterlogistics.storage.entity.OrderTaskEntity;
+import com.waterlogistics.storage.param.SysParamLoader;
+import com.waterlogistics.storage.repository.AlertMapper;
+import com.waterlogistics.storage.repository.OrderTaskMapper;
+import java.time.Instant;
+import java.time.LocalDateTime;
+import java.time.ZoneId;
+import java.util.Set;
+import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.amqp.rabbit.core.RabbitTemplate;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.event.EventListener;
+import org.springframework.stereotype.Component;
+import org.springframework.transaction.event.TransactionPhase;
+import org.springframework.transaction.event.TransactionalEventListener;
+
+/**
+ * 等待原因透出告警（11-05 序号 2 宋冰鑫）。
+ *
+ * <p>监听 {@link OrderStateChangedEvent}，当订单等待原因从非等待变为
+ * {@link WaitReason#WAIT_CARGO} 或 {@link WaitReason#WAIT_RESOURCE} 时，
+ * 写一条 {@code alert} 记录并经 {@code alert.event} MQ 推送给前端告警列表。
+ *
+ * <p>两类等待告警口径：
+ * <ul>
+ *   <li>{@link WaitReason#WAIT_CARGO} → {@link AlertType#WAIT_CARGO_TIMEOUT}（等待货物到巢）：
+ *       订单因货物未就绪进入等待，货物所在巢时隙锁在宽限期内未释放；</li>
+ *   <li>{@link WaitReason#WAIT_RESOURCE} → {@link AlertType#WAIT_RESOURCE}（等待资源）：
+ *       订单因资源不足转入等待队列；</li>
+ * </ul>
+ *
+ * <p>展示名与宽限期：等待货物到巢的展示名固定为「等待货物到巢」，宽限秒数不进展示名，
+ * 而是随 {@code alert.event} 的 {@code thresholdValue} 带给出口层拼进提示语。秒数取自
+ * {@code sys_param} 的 {@code cargoLockTimeoutSec}（缺省 300），参数改了提示语跟着变，
+ * 不在代码里写死。判定条件、签发时机与去重口径不因展示调整而改变。
+ *
+ * <p>11-06 序号 1：原第三类「货到巢超时」已裁撤（无生产调用点）。
+ * 货物到巢关的锁超时实际走 {@code WAIT_RESOURCE} 分支，由本类按等待原因自动发「等待资源」。
+ *
+ * <p>去重口径：同一订单同一等待原因在一次等待窗口内只发一条告警；当 waitReason 离开该值
+ * （变为 null 或其他等待原因）时清除去重标记，下次重新进入会再发。
+ *
+ * <p>边界：沿用 {@code alert} 表现有列，不新增表、不新增列；{@code alert_type} 取
+ * {@link AlertType} 中文取值，{@code level} 取 {@link AlertLevel#WARN}。
+ */
+@Component
+public class WaitReasonAlertEmitter {
+
+    private static final Logger log = LoggerFactory.getLogger(WaitReasonAlertEmitter.class);
+
+    private static final ZoneId DB_ZONE = ZoneId.of("Asia/Shanghai");
+
+    /** 已发告警的去重标记：key = orderId + "|" + waitReason */
+    private final Set<String> emitted = ConcurrentHashMap.newKeySet();
+
+    private final AlertMapper alertMapper;
+    private final OrderTaskMapper orderTaskMapper;
+    private final RabbitTemplate rabbitTemplate;
+    private final SysParamLoader sysParamLoader;
+
+    @Value("${wavenest.mq.exchange:wavenest.data}")
+    private String exchange;
+
+    public WaitReasonAlertEmitter(AlertMapper alertMapper,
+            OrderTaskMapper orderTaskMapper,
+            RabbitTemplate rabbitTemplate,
+            SysParamLoader sysParamLoader) {
+        this.alertMapper = alertMapper;
+        this.orderTaskMapper = orderTaskMapper;
+        this.rabbitTemplate = rabbitTemplate;
+        this.sysParamLoader = sysParamLoader;
+    }
+
+    /**
+     * 订单状态变更后检查等待原因。
+     *
+     * <p>使用 {@link TransactionalEventListener} 的 AFTER_COMMIT 相位，确保订单状态与
+     * wait_reason 已落库后再写 alert，避免回滚导致 alert 孤儿行。
+     */
+    @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT, fallbackExecution = true)
+    public void onOrderStateChanged(OrderStateChangedEvent event) {
+        WaitReason reason = event.view().waitReason();
+        String orderId = event.view().orderId();
+
+        if (reason == WaitReason.WAIT_CARGO) {
+            emitIfAbsent(orderId, WaitReason.WAIT_CARGO, AlertType.WAIT_CARGO_TIMEOUT);
+        } else if (reason == WaitReason.WAIT_RESOURCE) {
+            emitIfAbsent(orderId, WaitReason.WAIT_RESOURCE, AlertType.WAIT_RESOURCE);
+        } else {
+            // 离开等待态：清除所有等待原因的去重标记，下次进入可重新告警
+            clearEmitted(orderId);
+        }
+    }
+
+    /**
+     * 同一订单同一等待原因在一次等待窗口内只发一条。
+     *
+     * <p>11-06 序号 1：原「货到巢超时」入口（{@code emitCargoNestTimeout}）已移除。
+     * 该入口在生产链路无调用点——货物到巢关的锁超时实际走 {@code WAIT_RESOURCE} 分支，
+     * 由本类按等待原因自动发「等待资源」告警，不需要独立入口。
+     */
+    private void emitIfAbsent(String orderId, WaitReason reason, AlertType type) {
+        String key = dedupKey(orderId, type);
+        if (!emitted.add(key)) {
+            return;
+        }
+        emit(orderId, type);
+    }
+
+    private void emit(String orderId, AlertType type) {
+        OrderTaskEntity order = orderTaskMapper.selectById(orderId);
+        String droneId = order == null ? null : order.getDroneId();
+        long now = System.currentTimeMillis();
+        String eventId = UUID.randomUUID().toString();
+        Double graceLimitSec = graceLimitOf(type);
+
+        AlertEntity entity = new AlertEntity();
+        entity.setAlertId(eventId);
+        entity.setDroneId(droneId);
+        entity.setOrderId(orderId);
+        entity.setAlertType(type.getValue());
+        entity.setLevel(AlertLevel.WARN.getValue());
+        entity.setTriggerTime(LocalDateTime.ofInstant(Instant.ofEpochMilli(now), DB_ZONE));
+        entity.setHandleStatus("未处理");
+        try {
+            alertMapper.insert(entity);
+        } catch (Exception e) {
+            log.warn("等待原因告警落库失败（fail-soft）：orderId={} type={} err={}",
+                    orderId, type.getValue(), e.getMessage());
+        }
+
+        AlertEventMessage message = new AlertEventMessage(
+                eventId,
+                type.getValue(),
+                AlertLevel.WARN.getValue(),
+                0,
+                droneId,
+                orderId,
+                now,
+                null,
+                graceLimitSec,
+                null,
+                null);
+        publish(message);
+        log.info("等待原因告警已发出：orderId={} type={} droneId={} eventId={}",
+                orderId, type.getValue(), droneId, eventId);
+    }
+
+    /**
+     * 等待货物到巢时随事件带出的宽限秒数。
+     *
+     * <p>秒数取自 {@code sys_param} 的 {@code cargoLockTimeoutSec}，缺省值沿用门关登记的
+     * 300 秒；其他告警类型不带该值。出口层据此把秒数拼进提示语，展示名本身不含数字。
+     */
+    private Double graceLimitOf(AlertType type) {
+        if (type != AlertType.WAIT_CARGO_TIMEOUT) {
+            return null;
+        }
+        return (double) sysParamLoader.getInt(CargoNestGate.LOCK_TIMEOUT_KEY,
+                CargoNestGate.DEFAULT_LOCK_TIMEOUT_SEC);
+    }
+
+    /**
+     * 发送 alert.event MQ 消息。
+     *
+     * <p>抽成 protected 方法供单元测试覆盖，避免测试起 RabbitTemplate 连接。
+     */
+    protected void publish(AlertEventMessage message) {
+        try {
+            rabbitTemplate.convertAndSend(exchange, TopicName.ALERT_EVENT, message);
+        } catch (Exception e) {
+            log.warn("等待原因告警 MQ 发送失败（fail-soft）：orderId={} type={} err={}",
+                    message.orderId(), message.alertType(), e.getMessage());
+        }
+    }
+
+    private void clearEmitted(String orderId) {
+        emitted.removeIf(key -> key.startsWith(orderId + "|"));
+    }
+
+    private static String dedupKey(String orderId, AlertType type) {
+        return orderId + "|" + type.name();
+    }
+}

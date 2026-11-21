@@ -9,9 +9,10 @@
 --     rhoTh / vStopMs / mOfN / rotWindowFrames 已在 A 组段内，不重复灌）
 -- 未灌入（取值未定，报组长后补）：
 --   · C/D/F/G 组参数：83/82/85/86 只列名目、未给取值
---   · E 组 3 项待定：lenOverGroundM（按船型参数化）／e10HystExitRatio（换算口径待
---     拍板，见 53 §2 第 18 项）／e10RobustWindOffsetMs 与 e10AlphaFailProb 对应的
---     ②鲁棒裕度档、①机会约束档尚无上游风况分布可依，只灌 ③ 固定系数档
+--   · E 组待定：lenOverGroundM（按船型参数化）／e10RobustWindOffsetMs 与 e10AlphaFailProb
+--     对应的 ②鲁棒裕度档、①机会约束档尚无上游风况分布可依，只灌 ③ 固定系数档。
+--     e10HystEnterRatio／e10HystExitRatio 已于 2026-11-16 按比率语义定值，由 018 灌入，
+--     不再列入本文件的待定项
 -- =====================================================================
 
 USE `wavenest`;
@@ -48,7 +49,7 @@ INSERT INTO `sys_param` (`param_key`, `param_value`, `category`, `description`) 
 ('lcStepM',             '5',      '阈值', '换道步进门限'),
 ('lcCount',             '3',      '阈值', '换道确认数'),
 ('lcInflate',           '2.0',    '阈值', '机动期带宽膨胀'),
-('alphaAlongMs',        '0.05',   '阈值', '纵向模型误差率'),
+('alphaAlongMs',        '0.10',   '阈值', '纵向模型误差率'),
 ('alphaCrossMs',        '0.03',   '阈值', '横向模型误差率'),
 ('lTolM',               '150',    '阈值', '纵向容忍上限'),
 ('wTolM',               '40',     '阈值', '横向容忍上限'),
@@ -125,11 +126,11 @@ INSERT INTO `sys_param` (`param_key`, `param_value`, `category`, `description`) 
 
 -- ---------------- 未灌入的 E 组 3 项（取值未定，不臆造） ----------------
 --   lenOverGroundM      ：停车位移阈值（一船长），值为「按船型参数化」，无具体米数
---   e10HystExitRatio    ：第一级边界迟滞退出裕度；1.2 若直读会使退出比进入更保守，与迟滞语义
---                        矛盾，换算口径待拍板（53 §2 第 18 项）
 --   e10RobustWindOffsetMs / e10AlphaFailProb
 --                       ：分别对应 84 §2.3 ② 鲁棒裕度档与 ① 机会约束档，须上游给风况
 --                        分布／范围表达才可判档；首版只实现 ③ 固定系数档（e10MarginK）
+--   注：e10HystEnterRatio／e10HystExitRatio 的取值已于 2026-11-16 裁定（1.0／0.6），
+--       由 018_e10_hyst_slot_landing.sql 灌入，不在此段、也不计入本段 3 项
 
 -- ---------------- 10-16 序4 灌库（档D + 候选生成参数；张睿哲） ----------------
 -- 档 D：全项目低电量阈值（2026-10-18 口径修正：统一 lowBatteryTrigger=20）
@@ -153,10 +154,13 @@ INSERT INTO `sys_param` (`param_key`, `param_value`, `category`, `description`) 
 ('heartbeatLossWindowSec',       '120',  '窗口', '灭失判定窗口（秒）'),
 ('heartbeatCheckIntervalSec',    '5',    '窗口', '检测轮询间隔（秒）'),
 ('weatherWindWarningThreshold',  '8.0',  '阈值', '风速预警阈值（m/s）'),
-('weatherWindCriticalThreshold', '12.0', '阈值', '风速严重阈值（m/s）'),
+('weatherWindCriticalThreshold', '14.0', '阈值', '风速严重阈值（m/s）'),
 ('weatherWindSurgeThreshold',    '0.5',  '阈值', '风速突变阈值（(m/s)/s）'),
 ('weatherSurgeWindowSec',        '10',   '窗口', '突变检测窗口（秒）'),
 ('weatherClearDebounce',         '5',    '阈值', '清除防抖采样点数');
+-- 注：2026-10-27 T1-5——weatherWindCriticalThreshold 由 12.0 上调至 14.0，须高于机队最高
+--     机型抗风上限（M400 12.0 m/s，见 003）：留出 12～14 m/s 演示带，风速落在该区间时
+--     候选链全员抗风淘汰而闸门尚未熔断，「淘汰」与「熔断」两种行为可分别观察。
 -- 注：2026-10-18 已决——lowBatteryTrigger(20) 为全项目唯一低电量键，G 组告警与 E 组功能 10
 --     A5 兜底共用此键；原 E 组 e10LowBatteryAbs(15) 已删除，不再使用。
 

@@ -48,17 +48,17 @@ public final class DeviationTracker {
      *
      * <p><b>触发时机（U-01）</b>：每收到一次船位新状态即调用一次，<b>不设内部定时器</b>。
      *
+     * <p>本方法只判<b>横向偏差</b>（XTE）；沿航迹进度/ETA 不在覆盖范围，由调用方另行校验，
+     * 不得仅凭本结论推断「时间上仍按预测走」。
+     *
      * @param shipLon      船实测经度
      * @param shipLat      船实测纬度
      * @param forecastLons 预测航迹经度列（时间升序，长度 ≥ 2）
      * @param forecastLats 预测航迹纬度列（与经度列等长）
      * @param xtlM         当前航段走廊半宽（米），<b>由调用方按航段类型从 {@code sys_param} 选定</b>
-     * <p>本方法只判<b>横向偏差</b>（XTE）；沿航迹进度/ETA 不在覆盖范围，由调用方另行校验，
-     * 不得仅凭本结论推断「时间上仍按预测走」。
-     *
      * @return 前提成立性判定结果
      * @throws NullPointerException     航迹列为 null
-     * @throws IllegalArgumentException 航迹列长度不一致、点数不足或含非法数值；走廊半宽非正
+     * @throws IllegalArgumentException 航迹列长度不一致、点数不足、含非法数值、跨 ±180° 经线、所有段均退化；走廊半宽非正
      */
     public static PremiseVerdict track(double shipLon, double shipLat,
                                        List<Double> forecastLons, List<Double> forecastLats, double xtlM) {
@@ -72,13 +72,37 @@ public final class DeviationTracker {
                             + shipLon + ", shipLat=" + shipLat + ", xtlM=" + xtlM
             );
         }
-        if (forecastLons.size() != forecastLats.size()) {
-            throw new IllegalArgumentException("预测航迹经纬度列长度不一致：" + forecastLons.size() + " vs " + forecastLats.size());
+        DeviationTracker.validateForecast(forecastLons, forecastLats);
+        // 船位与航迹起点取同一经度表示；跨 ±180° 时按短侧折回，避免 XTE 出现整圈误差
+        double alignedShipLon = DeviationTracker.alignLon(shipLon, forecastLons.get(0).doubleValue());
+        double signedXte = CrossTrackError.signedM(alignedShipLon, shipLat, forecastLons, forecastLats);
+        if (!Double.isFinite(signedXte)) {
+            throw new IllegalArgumentException("横向偏差计算结果非有限，预测航迹入参非法");
         }
-        if (forecastLons.size() < 2) {
-            throw new IllegalArgumentException("预测航迹至少需 2 点，实为 " + forecastLons.size());
-        }
-        int pointCount = forecastLons.size();
+        double absXte = Math.abs(signedXte);
+        boolean outside = CrossTrackError.outsideCorridor(absXte, xtlM);
+
+        String absXteText = String.format(Locale.ROOT, "%.4f", Double.valueOf(absXte));
+        String xtlText = String.format(Locale.ROOT, "%.4f", Double.valueOf(xtlM));
+        return new PremiseVerdict(!outside, absXte, signedXte, xtlM, outside
+                ? "偏出走廊：|XTE|=" + absXteText + "m > XTL=" + xtlText
+                + "m，船不再沿预测航迹行驶，会面前提失效"
+                : "走廊内：|XTE|=" + absXteText + "m ≤ XTL=" + xtlText + "m，前提仍成立");
+    }
+
+
+
+
+
+    /**
+     * 校验预测航迹列——长度一致、点数不少于 2、逐点合法（非 null、有限数、经纬度范围）、不跨 ±180° 经线。
+     *
+     * @param forecastLons 预测航迹经度列（时间升序）
+     * @param forecastLats 预测航迹纬度列（与经度列等长）
+     * @throws IllegalArgumentException 任一校验不通过
+     */
+    private static void validateForecast(List<Double> forecastLons, List<Double> forecastLats) {
+        int pointCount = DeviationTracker.requireUsableForecast(forecastLons, forecastLats);
         for (int i = 0; i < pointCount; i++) {
             Double lonI = forecastLons.get(i);
             Double latI = forecastLats.get(i);
@@ -91,19 +115,59 @@ public final class DeviationTracker {
                 throw new IllegalArgumentException("预测航迹第 " + i + " 点经纬度必须为合法范围内的有限数");
             }
         }
-        double signedXte = CrossTrackError.signedM(shipLon, shipLat, forecastLons, forecastLats);
-        if (!Double.isFinite(signedXte)) {
-            throw new IllegalArgumentException("横向偏差计算结果非有限，预测航迹入参非法");
+        for (int i = 1; i < pointCount; i++) {
+            if (Math.abs(forecastLons.get(i).doubleValue() - forecastLons.get(i - 1).doubleValue()) >= 180.0) {
+                throw new IllegalArgumentException(
+                        "预测航迹跨 ±180° 经线，请先归一化经度：index " + (i - 1) + " -> " + i);
+            }
         }
-        double absXte = Math.abs(signedXte);
-        boolean outside = CrossTrackError.outsideCorridor(absXte, xtlM);
+        double originLon = forecastLons.get(0).doubleValue();
+        for (int i = 1; i < pointCount; i++) {
+            if (Math.abs(forecastLons.get(i).doubleValue() - originLon) >= 180.0) {
+                throw new IllegalArgumentException(
+                        "预测航迹整体跨 ±180° 经线，请先归一化经度：index 0 -> " + i);
+            }
+        }
+    }
 
-        String absXteText = String.format(Locale.ROOT, "%.3f", Double.valueOf(absXte));
-        String xtlText = String.format(Locale.ROOT, "%.3f", Double.valueOf(xtlM));
-        return new PremiseVerdict(!outside, absXte, signedXte, xtlM, outside
-                ? "偏出走廊：|XTE|=" + absXteText + "m > XTL=" + xtlText
-                + "m，船不再沿预测航迹行驶，会面前提失效"
-                : "走廊内：|XTE|=" + absXteText + "m ≤ XTL=" + xtlText + "m，前提仍成立");
+
+
+
+
+    /**
+     * 把经度折到与参考点同一侧的 ±180° 表示，供跨日界线船位使用。
+     */
+    private static double alignLon(double lon, double originLon) {
+        double delta = lon - originLon;
+        if (delta > 180.0) {
+            return lon - 360.0;
+        }
+        if (delta < -180.0) {
+            return lon + 360.0;
+        }
+        return lon;
+    }
+
+
+
+
+
+    /**
+     * 校验航迹列规模——长度一致且不少于 2 点，返回点数。
+     *
+     * @param forecastLons 预测航迹经度列
+     * @param forecastLats 预测航迹纬度列（与经度列等长）
+     * @return 航迹点数（不少于 2）
+     * @throws IllegalArgumentException 长度不一致或点数不足
+     */
+    private static int requireUsableForecast(List<Double> forecastLons, List<Double> forecastLats) {
+        if (forecastLons.size() != forecastLats.size()) {
+            throw new IllegalArgumentException("预测航迹经纬度列长度不一致：" + forecastLons.size() + " vs " + forecastLats.size());
+        }
+        if (forecastLons.size() < 2) {
+            throw new IllegalArgumentException("预测航迹至少需 2 点，实为 " + forecastLons.size());
+        }
+        return forecastLons.size();
     }
 
 
@@ -119,8 +183,8 @@ public final class DeviationTracker {
      * @param xtlM         判定所用走廊半宽（米）
      * @param reason       结论说明（供日志与 task_log 追溯）
      *
-     * <p>前置：{@code absXteM == Math.abs(signedXteM)}（不得单独按展示精度取整），
-     * 且 {@code premiseHolds == (absXteM <= xtlM)}。
+     *                     <p>前置：{@code absXteM == Math.abs(signedXteM)}（不得单独按展示精度取整），
+     *                     且 {@code premiseHolds == (absXteM <= xtlM)}。
      */
     public record PremiseVerdict(
             boolean premiseHolds,
@@ -142,10 +206,10 @@ public final class DeviationTracker {
             if (absXteM < (double) 0) {
                 throw new IllegalArgumentException("横向偏差绝对值不得为负，实为 " + absXteM);
             }
-            if (absXteM != Math.abs(signedXteM)) {
+            if (Math.abs(absXteM - Math.abs(signedXteM)) > 1.0e-9) {
                 throw new IllegalArgumentException("横向偏差绝对值与带符号值不一致：absXteM=" + absXteM + ", signedXteM=" + signedXteM);
             }
-            if (premiseHolds == (absXteM > xtlM)) {
+            if (premiseHolds == CrossTrackError.outsideCorridor(absXteM, xtlM)) {
                 throw new IllegalArgumentException(
                         "前提成立性与偏差／走廊半宽矛盾：absXteM=" + absXteM + ", xtlM=" + xtlM + ", premiseHolds=" + premiseHolds
                 );
@@ -163,7 +227,7 @@ public final class DeviationTracker {
          * 船是否偏在预测航迹左侧（供配合 ΔCOG 判改向意图，《84》§2.1 缺点③要求交叉判）。
          *
          * @return {@code true}＝带符号横向偏差为正，即船在预测航迹左侧；零偏差（正对航迹）
-         *         与右侧同为 {@code false}，需区分时直接读 {@code signedXteM}
+         * 与右侧同为 {@code false}，需区分时直接读 {@code signedXteM}
          */
         public boolean isLeftOfTrack() {
             return this.signedXteM > (double) 0;

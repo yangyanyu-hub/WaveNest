@@ -3,11 +3,22 @@ package com.waterlogistics.dispatch.order;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
+import com.waterlogistics.contract.order.OrderStateChangedEvent;
+import com.waterlogistics.contract.order.OrderView;
 import com.waterlogistics.contract.rest.DispatchGate;
 import com.waterlogistics.contract.rest.GateSource;
 import com.waterlogistics.contract.rest.GateStatus;
+import com.waterlogistics.contract.state.OrderStatus;
 import com.waterlogistics.dispatch.gate.DispatchGateService;
+import com.waterlogistics.dispatch.queue.TaskQueueService;
 import com.waterlogistics.dispatch.record.TaskLogRecorder;
+import com.waterlogistics.storage.entity.OrderTaskEntity;
+import com.waterlogistics.storage.repository.GoodsMapper;
+import com.waterlogistics.storage.repository.OrderTaskMapper;
+import com.waterlogistics.storage.repository.TaskLogMapper;
+
+import java.lang.reflect.Proxy;
+import java.util.List;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -25,13 +36,55 @@ import org.junit.jupiter.api.Test;
 class OrderControllerTest {
 
     private DispatchGateService gateService;
+    private OrderAdmissionService admissionService;
     private OrderController controller;
 
     @BeforeEach
     void setUp() {
         gateService = new DispatchGateService();
-        controller = new OrderController(
-                new OrderAdmissionService(new TaskLogRecorder(), event -> { }), gateService);
+        // 本测试只验 GET 回显，不触发 submit／cargo-ready 链路：装配器/唤醒器传 null 即可
+        // （本模块测试无 Mockito，JDK 动态代理又只能代理接口，null 是最省的桩）；
+        // 货物映射器同理只做占位，不参与本类的任何断言
+        admissionService = new OrderAdmissionService(new TaskLogRecorder(), event -> { },
+                null, null, null);
+        controller = new OrderController(admissionService, gateService,
+                new CargoReadyService(stubGoodsMapper(), stubOrderMapper(),
+                        new TaskQueueService(stubOrderMapper(), stubTaskLogMapper(), gateService)));
+    }
+
+    /** 全返回 null 的货物映射器桩（本类不断言货物路径）。 */
+    private static GoodsMapper stubGoodsMapper() {
+        return (GoodsMapper) Proxy.newProxyInstance(
+                GoodsMapper.class.getClassLoader(), new Class<?>[]{GoodsMapper.class},
+                (proxy, method, args) -> null);
+    }
+
+    /** 订单映射器桩：返回一行带货巢的订单，供到巢登记做巢核对。 */
+    private static OrderTaskMapper stubOrderMapper() {
+        return (OrderTaskMapper) Proxy.newProxyInstance(
+                OrderTaskMapper.class.getClassLoader(), new Class<?>[]{OrderTaskMapper.class},
+                (proxy, method, args) -> {
+                    if ("selectOne".equals(method.getName())) {
+                        OrderTaskEntity order = new OrderTaskEntity();
+                        order.setOrderId("ORD-1");
+                        order.setCargoNestId("NEST-01");
+                        return order;
+                    }
+                    return null;
+                });
+    }
+
+    /** {@code task_log} 桩：本类不断言留痕，仅满足构造依赖。 */
+    private static TaskLogMapper stubTaskLogMapper() {
+        return (TaskLogMapper) Proxy.newProxyInstance(
+                TaskLogMapper.class.getClassLoader(), new Class<?>[]{TaskLogMapper.class},
+                (proxy, method, args) -> {
+                    Class<?> rt = method.getReturnType();
+                    if (rt == int.class) {
+                        return 1;
+                    }
+                    return rt == boolean.class ? false : null;
+                });
     }
 
     @Test
@@ -82,5 +135,76 @@ class OrderControllerTest {
 
         gateService.clear(GateSource.AUTO);
         assertEquals(GateStatus.NORMAL, controller.listOrders().dispatchGate().gateStatus());
+    }
+
+    @Test
+    @DisplayName("cargo-ready 端点转发到 CargoReadyService（桩表全空 → 查无货物）")
+    void cargoReady_shouldDelegateToService() {
+        CargoReadyResponse response = controller.cargoReady("ORD-1", new CargoReadyRequest("NEST-01"));
+
+        assertEquals(false, response.accepted());
+        assertEquals(CargoReadyResponse.Reason.GOODS_NOT_FOUND.name(), response.reasonCode());
+        assertEquals("ORD-1", response.orderId(), "订单号要回显，便于前端对号");
+    }
+
+    @Test
+    @DisplayName("cargo-ready 端点：请求体缺货巢编号按业务拒绝处理，不是接口故障")
+    void cargoReady_withoutRequestBody_shouldRejectAsBusiness() {
+        CargoReadyResponse response = controller.cargoReady("ORD-1", null);
+
+        assertEquals(false, response.accepted());
+        assertEquals(CargoReadyResponse.Reason.CARGO_NEST_REQUIRED.name(), response.reasonCode());
+    }
+
+    // ───────── 11-05 序号 2：两个评审项的守门用例 ─────────
+
+    @Test
+    @DisplayName("★ MED-BUG.33：空请求体走业务拒绝（200 ＋ reasonCode），而不是 400")
+    void emptyBody_shouldRejectAsBusinessNotHttp400() {
+        OrderSubmitResponse response = controller.submitOrder(null);
+
+        assertEquals(false, response.accepted());
+        assertEquals("REQUEST_MISSING", response.reasonCode(),
+                "改前 @RequestBody 必填，空 body 在进入方法前就被框架判 400，"
+                        + "于是「请求体缺失」成为唯一走 4xx 的业务拒绝");
+        assertEquals("请求体缺失", response.message());
+    }
+
+    @Test
+    @DisplayName("★ LOW-PERF.1：列表按状态过滤，只回匹配项")
+    void listOrders_shouldFilterByStatus() {
+        seed("ORD-1", OrderStatus.WAIT_DISPATCH);
+        seed("ORD-2", OrderStatus.DISPATCHED);
+        seed("ORD-3", OrderStatus.WAIT_DISPATCH);
+
+        assertEquals(List.of("ORD-1", "ORD-3"),
+                controller.listOrders("待调度", null).orders().stream()
+                        .map(OrderView::orderId).toList());
+        // 枚举名同样可用（运维习惯按代码检索）
+        assertEquals(1, controller.listOrders("DISPATCHED", null).orders().size());
+        assertEquals(3, controller.listOrders(null, null).orders().size(), "不传状态即全量");
+    }
+
+    @Test
+    @DisplayName("★ LOW-PERF.1：条数上限生效；无法识别的状态值返回空列表（不静默回全量）")
+    void listOrders_shouldLimitAndRejectUnknownStatus() {
+        seed("ORD-1", OrderStatus.WAIT_DISPATCH);
+        seed("ORD-2", OrderStatus.WAIT_DISPATCH);
+
+        assertEquals(1, controller.listOrders(null, 1).orders().size());
+        assertTrue(controller.listOrders("不存在的状态", null).orders().isEmpty(),
+                "拼错状态若回全量，会让人误以为过滤生效了");
+    }
+
+    @Test
+    @DisplayName("配送品类字典接口返回当前生效集合，不返回默认全集之外的项")
+    void cargoTypes_shouldReturnEffectiveCatalog() {
+        assertEquals(CargoTypeCatalog.defaults(), controller.cargoTypes().cargoTypes());
+    }
+
+    /** 往内存视图里塞一条订单（走生产同一条 {@code onOrderStateChanged} 入口）。 */
+    private void seed(String orderId, OrderStatus status) {
+        admissionService.onOrderStateChanged(new OrderStateChangedEvent(new OrderView(
+                orderId, status, System.currentTimeMillis(), 1L, null, null, null, null, null)));
     }
 }

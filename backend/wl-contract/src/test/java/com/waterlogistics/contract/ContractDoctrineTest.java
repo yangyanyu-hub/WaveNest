@@ -31,15 +31,19 @@ class ContractDoctrineTest {
 
     /**
      * 《22》§1.2 的 12 个主题：raw.* 五条、data.* 五条、alert.event、task.plan；
-     * ＋《86》附 G-01 新增的 {@code rendezvous.deviation}（功能 19 数据回流，非告警通道）＝ 13 个。
+     * ＋《86》附 G-01 新增的 {@code rendezvous.deviation}（功能 19 数据回流，非告警通道）；
+     * ＋投放回执 {@code data.uav.delivery}；
+     * ＋落巢回收确认 {@code data.uav.recycle}（11-07 弥补计划 D-09／D-16）＝ 15 个。
      */
     @Test
-    void topics_shouldBeThirteenAndAuthoritative() {
-        assertEquals(13, TopicName.TOPICS.size(), "主题数量必须为 12＋1（rendezvous.deviation）");
+    void topics_shouldBeFifteenAndAuthoritative() {
+        assertEquals(15, TopicName.TOPICS.size(),
+                "主题数量必须为 12＋3（rendezvous.deviation、data.uav.delivery、data.uav.recycle）");
         assertEquals(List.of(
                         "raw.ais", "raw.uav.telemetry", "raw.weather", "raw.hydro", "raw.notice",
                         "data.ais", "data.uav.telemetry", "data.weather", "data.hydro", "data.notice",
-                        "alert.event", "task.plan", "rendezvous.deviation"),
+                        "alert.event", "task.plan", "rendezvous.deviation", "data.uav.delivery",
+                        "data.uav.recycle"),
                 TopicName.TOPICS);
     }
 
@@ -79,10 +83,13 @@ class ContractDoctrineTest {
         assertTrue(DroneStatus.IDLE.isCandidate());
     }
 
-    /** 《22》§3.1 等待原因三值（由算法层四类合并而来） */
+    /**
+     * 《22》§3.1 等待原因四值（原三值由算法层四类合并而来；11-05 序号 1 增
+     * {@code WAIT_RESOURCE}——货物所在巢时隙锁超时／无可用占位的资源等待）
+     */
     @Test
-    void waitReason_shouldBeThreeValues() {
-        assertEquals(List.of("WAIT_SHIP", "WAIT_CARGO", "GATE_OR_DATA"),
+    void waitReason_shouldHaveFourValues() {
+        assertEquals(List.of("WAIT_SHIP", "WAIT_CARGO", "GATE_OR_DATA", "WAIT_RESOURCE"),
                 codes(WaitReason.values()));
     }
 
@@ -93,18 +100,23 @@ class ContractDoctrineTest {
         assertEquals(List.of("人工冻结", "自动熔断"), values(GateSource.values()));
     }
 
-    /** 《22》§2 告警类型五类、级别三级（以《37》§5.12 alert 表为准） */
+    /** 《22》§2 告警类型五类检测告警 ＋ 三类订单级告警、级别三级（以《37》§5.12 alert 表为准） */
     @Test
     void alert_shouldFollow37Section512() {
-        assertEquals(List.of("失联", "低电量", "偏航", "气象超限", "链路异常"),
+        assertEquals(List.of("失联", "低电量", "偏航", "气象超限", "链路异常",
+                        "等待货物到巢", "等待资源", "订单待处置"),
                 values(AlertType.values()));
         assertEquals(List.of("提示", "警告", "严重"), values(AlertLevel.values()));
     }
 
-    /** 《22》§4 五类 WS 帧 */
+    /**
+     * 《22》§4 WS 帧。11-19 起为七类：新增天气帧 {@code weather}（网格点风况，
+     * 载荷即 {@code WeatherData}），写入方为 M5 独立队列消费 {@code data.weather} 后转发；
+     * 前端消费分支已随 11-14 任务 2-7 先行落地。
+     */
     @Test
-    void wsFrameTypes_shouldBeFive() {
-        assertEquals(List.of("ship_traj", "drone_state", "rendezvous", "alarm", "order_state"),
+    void wsFrameTypes_shouldBeSeven() {
+        assertEquals(List.of("ship_traj", "drone_state", "rendezvous", "alarm", "order_state", "plan_track", "weather"),
                 Arrays.stream(WsFrameType.values()).map(WsFrameType::getType).toList());
     }
 

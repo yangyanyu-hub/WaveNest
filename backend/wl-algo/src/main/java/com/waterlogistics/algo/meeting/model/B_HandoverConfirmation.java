@@ -1,7 +1,5 @@
 package com.waterlogistics.algo.meeting.model;
 
-import java.util.Objects;
-
 /**
  * 交接完成确认（{@code B_} 前缀＝算法层 B 组产出）——字段照《81-B组算法方案》§2.3
  * 第（6）项一字不改。
@@ -54,35 +52,52 @@ public record B_HandoverConfirmation(
         HandoverResult handoverResult) {
 
     public B_HandoverConfirmation {
-        Objects.requireNonNull(taskId, "taskId 不能为空");
-        Objects.requireNonNull(droneId, "droneId 不能为空");
-        Objects.requireNonNull(handoverResult, "handoverResult 不能为空");
+        if (taskId == null || taskId.isBlank()) {
+            throw new IllegalArgumentException("taskId 不能为空或空白");
+        }
+        if (droneId == null || droneId.isBlank()) {
+            throw new IllegalArgumentException("droneId 不能为空或空白");
+        }
+        if (handoverResult == null) {
+            throw new IllegalArgumentException("handoverResult 不能为空");
+        }
         if ((actualMeetLon == null) != (actualMeetLat == null)) {
             throw new IllegalArgumentException("实际会面点经度与纬度须同时存在或同时为空");
         }
         requireCoordinate(plannedMeetLon, plannedMeetLat, "planned");
+        if (!EpochMillis.isValid(plannedMeetT)) {
+            throw new IllegalArgumentException("计划会面时刻须为 Unix 毫秒值（范围 ["
+                    + EpochMillis.MIN_VALID_MS + ", " + EpochMillis.MAX_VALID_MS + "]），实际 "
+                    + plannedMeetT);
+        }
         if (actualMeetLon != null) {
             requireCoordinate(actualMeetLon, actualMeetLat, "actual");
         }
-        if (handoverResult == HandoverResult.SUCCESS) {
-            if (handoverDoneT == null) {
-                throw new IllegalArgumentException("交接成功却缺交接完成时刻（taskId=" + taskId + "）");
+        if (handoverDoneT != null && !EpochMillis.isValid(handoverDoneT.longValue())) {
+            throw new IllegalArgumentException("交接完成时刻须为有效的 Unix 毫秒值，实际 handoverDoneT="
+                    + handoverDoneT + "（taskId=" + taskId + "）");
+        }
+        switch (handoverResult) {
+            case SUCCESS -> {
+                if (handoverDoneT == null) {
+                    throw new IllegalArgumentException("交接成功却缺交接完成时刻（taskId=" + taskId + "）");
+                }
+                if (actualMeetLon == null || actualMeetLat == null) {
+                    throw new IllegalArgumentException("交接成功却缺实际会面点（taskId=" + taskId + "）");
+                }
+                if (escortTimeCost == null || handoverTimeCost == null || energyCost == null) {
+                    throw new IllegalArgumentException("交接成功却缺开销字段（taskId=" + taskId + "）");
+                }
             }
-            if (actualMeetLon == null || actualMeetLat == null) {
-                throw new IllegalArgumentException("交接成功却缺实际会面点（taskId=" + taskId + "）");
+            case FAILED -> {
+                if (handoverDoneT != null || escortTimeCost != null
+                        || handoverTimeCost != null || energyCost != null) {
+                    throw new IllegalArgumentException("交接失败却带完成时刻或开销字段（taskId=" + taskId + "）");
+                }
             }
-            if (escortTimeCost == null || handoverTimeCost == null || energyCost == null) {
-                throw new IllegalArgumentException("交接成功却缺开销字段（taskId=" + taskId + "）");
-            }
-            if (handoverDoneT < 0L || handoverDoneT < plannedMeetT) {
-                throw new IllegalArgumentException("交接完成时刻须有效且不早于计划会面时刻，实际 plannedMeetT="
-                        + plannedMeetT + ", handoverDoneT=" + handoverDoneT + "（taskId=" + taskId + "）");
-            }
-        } else if (handoverResult == HandoverResult.FAILED) {
-            if (handoverDoneT != null || escortTimeCost != null
-                    || handoverTimeCost != null || energyCost != null) {
-                throw new IllegalArgumentException("交接失败却带完成时刻或开销字段（taskId=" + taskId + "）");
-            }
+            default -> throw new IllegalArgumentException(
+                    "未支持的交接结果，无法校验字段完整性：" + handoverResult + "（taskId=" + taskId + "）");
+
         }
         if (escortTimeCost != null && escortTimeCost < 0) {
             throw new IllegalArgumentException("伴飞时间开销不得为负，实际 " + escortTimeCost);
@@ -91,14 +106,17 @@ public record B_HandoverConfirmation(
             throw new IllegalArgumentException("交接时间开销不得为负，实际 " + handoverTimeCost);
         }
         if (energyCost != null
-                && (!Double.isFinite(energyCost) || energyCost < 0.0 || energyCost > 100.0)) {
+                && (!Double.isFinite(energyCost) || energyCost < 0.0 || energyCost > 100.0 + 1.0e-6)) {
             throw new IllegalArgumentException("能耗开销须在 [0,100]，实际 " + energyCost);
+        }
+        if (energyCost != null && energyCost > 100.0) {
+            energyCost = 100.0;
         }
     }
 
     private static void requireCoordinate(Double lon, Double lat, String name) {
         if (lon == null || lat == null) {
-            return;
+            throw new IllegalArgumentException(name + " 会面坐标不能为空");
         }
         if (!Double.isFinite(lon) || lon < -180.0 || lon > 180.0
                 || !Double.isFinite(lat) || lat < -90.0 || lat > 90.0) {

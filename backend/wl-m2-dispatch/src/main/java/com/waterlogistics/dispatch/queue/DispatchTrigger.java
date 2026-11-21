@@ -1,8 +1,14 @@
 package com.waterlogistics.dispatch.queue;
 
+import com.waterlogistics.contract.state.GoodsStatus;
 import com.waterlogistics.contract.state.OrderStatus;
+import com.waterlogistics.contract.ws.ShipTrajPoint;
 import com.waterlogistics.dispatch.order.OrderSubmittedEvent;
+import com.waterlogistics.dispatch.plan.DispatchOrchestrator;
+import com.waterlogistics.dispatch.prediction.PredictionService;
+import com.waterlogistics.storage.entity.GoodsEntity;
 import com.waterlogistics.storage.entity.OrderTaskEntity;
+import com.waterlogistics.storage.repository.GoodsMapper;
 import com.waterlogistics.storage.repository.OrderTaskMapper;
 import java.math.BigDecimal;
 import java.time.Instant;
@@ -12,48 +18,128 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.event.EventListener;
 import org.springframework.stereotype.Component;
-import org.springframework.transaction.annotation.Transactional;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 主链触发器（B0 · 10-20 任务清单）。
+ * 主链触发器（B0 · 10-20 任务清单；C0 · 10-21 续接派发编排）。
  *
- * <p>下单 → 受理 → 组批 → 候选 → 会面 → 派发 的<b>自动推进器</b>：
+ * <p>下单 → 受理 → 组批 → 选机 → 会面 → 派发 的<b>自动推进器</b>：
  * 监听 {@link OrderSubmittedEvent}，把内存中的订单落到 {@code order_task}，
  * 再驱动 {@link TaskQueueService#accept}（待受理 → 待调度）→
- * {@link TaskQueueService#startDispatch}（待调度 → 调度中），
- * 使订单不再卡在「待受理」。
+ * {@link DispatchOrchestrator#orchestrate}（组批 → 选机 → 会面 → 派发），
+ * 使订单自然走到「已派发」。
  *
  * <p><b>闸门联动（B3）</b>：{@code startDispatch} 内部已查 {@code DispatchGateService}，
- * 熔断时自动转「已受理待唤醒」，不在此处重复判定。
+ * 熔断时自动转「已受理待唤醒」，编排器检测到后即结束本轮（不选机、不求解），
+ * 不在此处重复判定。
  *
- * <p>本类<b>不处理</b>候选计算、会面求解、派发（droneId 回填）——那些由后续
- * 调度链在「调度中」状态下异步完成，本触发器只负责把订单推进到「调度中」入口。
+ * <p><b>落库时补船位</b>：{@code ship_lon}/{@code ship_lat} 不由客户端提交
+ * （{@code OrderSubmitRequest} javadoc：服务端自行掌握、写入前补），
+ * 此处从 {@link PredictionService} 最新快照取当前船位写入——
+ * 候选距离过滤与会面求解都以该船位为前提。
  */
 @Component
 public class DispatchTrigger {
 
     private static final Logger log = LoggerFactory.getLogger(DispatchTrigger.class);
+    private static final ZoneId DB_ZONE = ZoneId.of("Asia/Shanghai");
+
+    /**
+     * 单次触发最多扫描的待调度订单数（11-05 序号 2 批量取单上限）。
+     * 不是阈值/闸门参数，只是防长队列阻塞下单事件的保险丝，故不进 sys_param。
+     */
+    private static final int BATCH_SIZE = 20;
+
+    /**
+     * 未指定货巢订单的货物初态（D-01）：货不需要到巢，建行即算就绪。
+     * 指定货巢仍写「未就绪」，由运营侧 cargo-ready 推进。
+     * 取值见 {@code 1106-remediation-contract.md} §1.1。
+     */
 
     private final OrderTaskMapper orderTaskMapper;
+    private final GoodsMapper goodsMapper;
     private final TaskQueueService taskQueueService;
+    private final DispatchOrchestrator dispatchOrchestrator;
+    private final PredictionService predictionService;
+    private final TransactionTemplate transactionTemplate;
 
-    public DispatchTrigger(OrderTaskMapper orderTaskMapper, TaskQueueService taskQueueService) {
+    @org.springframework.beans.factory.annotation.Autowired
+    public DispatchTrigger(OrderTaskMapper orderTaskMapper, GoodsMapper goodsMapper,
+            TaskQueueService taskQueueService,
+            DispatchOrchestrator dispatchOrchestrator, PredictionService predictionService,
+            PlatformTransactionManager transactionManager) {
         this.orderTaskMapper = orderTaskMapper;
+        this.goodsMapper = goodsMapper;
         this.taskQueueService = taskQueueService;
+        this.dispatchOrchestrator = dispatchOrchestrator;
+        this.predictionService = predictionService;
+        this.transactionTemplate = new TransactionTemplate(transactionManager);
     }
 
     /**
-     * 订单受理事件处理：落库 → 受理 → 组批调度。
+     * 兼容构造器：旧 arity（不含 {@code GoodsMapper}），货物行不落库。
      *
-     * <p>整链路在同一事务内：任一步失败则回滚，订单不产生脏状态。
+     * <p>保留给既有单测与调用点；生产装配走含 {@code GoodsMapper} 的构造器。
+     * 未接 {@code GoodsMapper} 时跳过建行，不抛异常——货物档案缺失不该阻断订单落库。
+     */
+    public DispatchTrigger(OrderTaskMapper orderTaskMapper, TaskQueueService taskQueueService,
+            DispatchOrchestrator dispatchOrchestrator, PredictionService predictionService,
+            PlatformTransactionManager transactionManager) {
+        this(orderTaskMapper, null, taskQueueService, dispatchOrchestrator, predictionService,
+                transactionManager);
+    }
+
+    /**
+     * 订单受理事件处理：落库 → 受理 → 派发编排（组批 → 选机 → 会面 → 派发）。
+     *
+     * <p>先在短事务里落单并受理，再由编排器在自己的事务内派发。
      * 事件发布方（OrderAdmissionService）不依赖本监听器的返回值，
      * 失败仅记录日志，不阻断下单响应（下单已返回 accepted）。
      */
     @EventListener
-    @Transactional
     public void onOrderSubmitted(OrderSubmittedEvent event) {
+        if (event == null) {
+            log.warn("忽略空的订单受理事件");
+            return;
+        }
         String orderId = event.orderId();
         try {
+            if (orderTaskMapper.selectById(orderId) != null) {
+                log.info("订单事件重复投递，跳过：orderId={}", orderId);
+                return;
+            }
+            if (event.deferred()) {
+                // 阶段一 26：接单判定为「延后待唤醒」的单子——落库即「已受理待唤醒」，
+                // 不受理、不组批；唤醒由 AdmissionWakeScheduler（定时）或
+                // WeatherClearWaker（闸门解除）推回调度链
+                OrderTaskEntity deferred = new OrderTaskEntity();
+                deferred.setOrderId(orderId);
+                deferred.setShipMmsi(event.shipMmsi());
+                deferred.setGoodsWeight(event.goodsWeightDecimal());
+                deferred.setGoodsType(event.goodsType());
+                if (event.expectedTimeMs() != null) {
+                    deferred.setExpectedTime(LocalDateTime.ofInstant(
+                            Instant.ofEpochMilli(event.expectedTimeMs()), DB_ZONE));
+                }
+                deferred.setEtaTs(toDbTime(event.etaTs()));
+                deferred.setPriority(event.priority());
+                deferred.setCargoNestId(event.cargoNestId());
+                deferred.setCreateTime(LocalDateTime.ofInstant(
+                        Instant.ofEpochMilli(event.submitTsMs()), DB_ZONE));
+                deferred.setStatus(OrderStatus.ACCEPTED_WAIT_WAKE.getValue());
+                fillShipPosition(deferred);
+                transactionTemplate.executeWithoutResult(status -> {
+                    if (orderTaskMapper.selectById(orderId) == null) {
+                        orderTaskMapper.insert(deferred);
+                        insertGoodsRow(event);
+                    }
+                });
+                log.info("延后单落库：orderId={} waitReason={} wakeEtaTs={}",
+                        orderId, event.waitReason(), event.wakeEtaTs());
+                return;
+            }
+
             // 1. 落库 order_task（待受理）——OrderAdmissionService 只存内存，落库由 queue 负责
             OrderTaskEntity entity = new OrderTaskEntity();
             entity.setOrderId(orderId);
@@ -62,24 +148,113 @@ public class DispatchTrigger {
             entity.setGoodsType(event.goodsType());
             if (event.expectedTimeMs() != null) {
                 entity.setExpectedTime(LocalDateTime.ofInstant(
-                        Instant.ofEpochMilli(event.expectedTimeMs()), ZoneId.systemDefault()));
+                        Instant.ofEpochMilli(event.expectedTimeMs()), DB_ZONE));
             }
+            entity.setEtaTs(toDbTime(event.etaTs()));
             entity.setPriority(event.priority());
+            entity.setCargoNestId(event.cargoNestId());
             entity.setCreateTime(LocalDateTime.ofInstant(
-                    Instant.ofEpochMilli(event.submitTsMs()), ZoneId.systemDefault()));
+                    Instant.ofEpochMilli(event.submitTsMs()), DB_ZONE));
             entity.setStatus(OrderStatus.PENDING_ACCEPT.getValue());
-            orderTaskMapper.insert(entity);
+            fillShipPosition(entity);
+            transactionTemplate.executeWithoutResult(status -> {
+                if (orderTaskMapper.selectById(orderId) != null) {
+                    throw new IllegalStateException("订单事件重复投递：" + orderId);
+                }
+                orderTaskMapper.insert(entity);
+                insertGoodsRow(event);
+                // 落库与受理是一笔短事务；编排另起事务，不持有下单写锁。
+                taskQueueService.accept(entity);
+            });
 
-            // 2. 受理：待受理 → 待调度
-            taskQueueService.accept(entity);
-
-            // 3. 组批调度：待调度 → 调度中（B3 闸门熔断时自动转已受理待唤醒）
-            taskQueueService.startDispatch(orderId);
-
-            log.info("主链触发完成：orderId={} 已推进至「调度中」", orderId);
+            // 3. 派发编排（C0 + 11-05 序号 2 批量取单）：不再直接编排本单，
+            //    而是按 selectNext 的优先级序取队首——同批等待单中应急先于常规被取单。
+            //    闸门熔断/货到巢关延后时编排器返回 null（订单留在「已受理待唤醒」），
+            //    继续尝试队列中的下一笔；首次成功派发后停止本轮（一次事件至多派一单）。
+            for (OrderTaskEntity next : taskQueueService.selectNext(BATCH_SIZE)) {
+                String droneId;
+                try {
+                    droneId = dispatchOrchestrator.orchestrate(next.getOrderId());
+                } catch (Exception ex) {
+                    // 编排失败已回滚（订单留在「待调度」），跳过本笔记日志，不阻断队列其余订单
+                    log.warn("批量取单编排失败，试下一笔：orderId={} err={}", next.getOrderId(), ex.getMessage());
+                    continue;
+                }
+                if (droneId != null) {
+                    log.info("主链触发完成：触发单 orderId={}，实际派发 orderId={} 至 droneId={}",
+                            orderId, next.getOrderId(), droneId);
+                    break;
+                }
+                log.info("批量取单队首延后：orderId={} 转已受理待唤醒，试下一笔", next.getOrderId());
+            }
         } catch (Exception e) {
             log.error("主链触发失败：orderId={} err={}", orderId, e.getMessage(), e);
-            throw e; // 事务回滚
+            // 事件由下单请求同步发布；失败留在日志中，由监控和重试链路处理，
+            // 不把调度异常伪装成下单接口失败。
         }
+    }
+
+    /**
+     * 建货物行（11-06 序号 1 · 货物档案落库；11-07 按 D-01 补无货巢语义）。
+     *
+     * <p><b>口径</b>：订单没有货巢时写「已就绪」且 {@code location} 留空——货物不经过
+     * 货到巢关，{@code FlightPhaseAdvancer} 切「去程中」时的 {@code load} 才有合法前态。
+     * 订单带货巢时写「未就绪」，等货物实际到巢后由 cargo-ready 登记推进。
+     * 货巢可能来自系统在下单时刻的决策，也可能来自客户端显式指定，本方法不区分来源，
+     * 只看订单上有没有货巢。
+     *
+     * <p>{@code goods_id} 取 {@code G-{orderId}-1}：一单一货行，标识可由订单号直接推出，
+     * 不另引入随机段，避免重投事件造出第二条货物行。
+     *
+     * @param event 订单受理事件，提供订单号、货型、重量、货巢
+     */
+    private void insertGoodsRow(OrderSubmittedEvent event) {
+        if (goodsMapper == null) {
+            // 兼容构造器路径（既有纯单测）：本构造器不覆盖货物链，见构造器 javadoc
+            return;
+        }
+        boolean hasCargoNest = event.cargoNestId() != null && !event.cargoNestId().isBlank();
+        GoodsEntity goods = new GoodsEntity();
+        goods.setGoodsId("G-" + event.orderId() + "-1");
+        goods.setOrderId(event.orderId());
+        goods.setWeight(event.goodsWeightDecimal());
+        goods.setType(event.goodsType());
+        goods.setStatus(hasCargoNest
+                ? GoodsStatus.NOT_READY.getValue()
+                : GoodsStatus.READY.getValue());
+        goods.setLocation(event.cargoNestId());
+        goodsMapper.insert(goods);
+    }
+
+    /**
+     * Unix 毫秒转库内 {@code LocalDateTime}（{@code Asia/Shanghai}）。
+     *
+     * @param tsMs Unix 毫秒；{@code null} 原样返回 {@code null}（未算出的 ETA 就该是 NULL）
+     * @return 库内时刻，可空
+     */
+    private static LocalDateTime toDbTime(Long tsMs) {
+        return tsMs == null ? null : LocalDateTime.ofInstant(Instant.ofEpochMilli(tsMs), DB_ZONE);
+    }
+
+    /**
+     * 落库前补「下单时目标船位」：取预测快照的当前点（轨迹首点，即最新观测位置）。
+     * 该船尚无快照时留空——候选距离过滤与会面求解会因数据不足而拒绝，
+     * 本方法不臆造船位（缺数据是「看不到船」，不是「船在原点」）。
+     */
+    private void fillShipPosition(OrderTaskEntity entity) {
+        predictionService.snapshotOf(entity.getShipMmsi()).ifPresent(snapshot -> {
+            if (!snapshot.points().isEmpty()) {
+                ShipTrajPoint current = snapshot.points().get(0);
+                if (Double.isFinite(current.lon()) && Double.isFinite(current.lat())
+                        && current.lon() >= -180 && current.lon() <= 180
+                        && current.lat() >= -90 && current.lat() <= 90) {
+                    entity.setShipLon(BigDecimal.valueOf(current.lon()));
+                    entity.setShipLat(BigDecimal.valueOf(current.lat()));
+                } else {
+                    log.warn("忽略非法预测船位：mmsi={} lon={} lat={}",
+                            entity.getShipMmsi(), current.lon(), current.lat());
+                }
+            }
+        });
     }
 }

@@ -6,4 +6,6 @@ dependencies {
     api(project(":wl-storage"))
     api(libs.bundles.web.common)
     implementation(libs.bundles.mq)
+    implementation(libs.spring.boot.starter.data.redis)
+    testImplementation(libs.mockito.core)
 }

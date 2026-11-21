@@ -25,13 +25,11 @@ public class SnapshotVersionMismatchException extends RuntimeException {
     /**
      * 调用方期望的快照版本（原样保留，可能为空/空白）
      */
-    @Getter
     private final String expected;
 
     /**
      * 端口实际取回的版本（原样保留，可能为空/空白）
      */
-    @Getter
     private final String actual;
 
 
@@ -44,12 +42,58 @@ public class SnapshotVersionMismatchException extends RuntimeException {
      * @param actual   端口实际取回的版本
      */
     public SnapshotVersionMismatchException(String shipMmsi, String expected, String actual) {
+        this(shipMmsi, expected, actual, null);
+    }
+
+
+
+
+
+    /**
+     * @param shipMmsi 目标船标识
+     * @param expected 调用方期望的快照版本
+     * @param actual   端口实际取回的版本
+     * @param cause    导致版本校验失败的底层原因
+     */
+    public SnapshotVersionMismatchException(String shipMmsi, String expected, String actual,
+                                            Throwable cause) {
         super("快照版本不一致，拒绝求解：船 "
-                      + (shipMmsi == null || shipMmsi.isBlank() ? "<unknown>" : shipMmsi)
-                      + "，期望版本 " + (expected == null || expected.isBlank() ? "<none>" : expected)
-                      + "，实际版本 " + (actual == null || actual.isBlank() ? "<none>" : actual));
+                      + com.waterlogistics.rendezvous.support.WireText.escapeForLog(
+                shipMmsi == null || shipMmsi.isBlank() ? "<unknown>" : shipMmsi)
+                      + "，期望版本 "
+                      + com.waterlogistics.rendezvous.support.WireText.escapeForLog(
+                expected == null || expected.isBlank() ? "<none>" : expected)
+                      + "，实际版本 "
+                      + com.waterlogistics.rendezvous.support.WireText.escapeForLog(
+                actual == null || actual.isBlank() ? "<none>" : actual), cause);
         this.shipMmsi = shipMmsi;
         this.expected = expected;
         this.actual = actual;
+    }
+
+
+
+
+
+    /**
+     * 返回调用方期望的快照版本。
+     *
+     * @return 期望版本；空/空白时归一为 {@code <none>}，便于日志与排障
+     */
+    public String getExpected() {
+        return this.expected == null || this.expected.isBlank() ? "<none>" : this.expected;
+    }
+
+
+
+
+
+    /**
+     * 返回端口实际取回的版本。
+     *
+     * @return 实际版本；空/空白时归一为 {@code <none>}，便于日志与排障
+     */
+    public String getActual() {
+        return this.actual == null || this.actual.isBlank() ? "<none>" : this.actual;
     }
 }
